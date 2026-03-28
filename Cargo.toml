@@ -38,7 +38,7 @@ platform-dirs = "0.3.0"
 precept = "0.3.0"
 rand = "0.10.0"
 range-set-blaze = "0.4.1"
-reqwest = { version = "0.12.26", default-features = false, features = ["hickory-dns"] }
+reqwest = { version = "0.12.26", default-features = false, features = ["hickory-dns", "rustls-tls"] }
 rs_merkle = "1.4"
 rusqlite = "0.38.0"
 serde = "1.0.228"
