@@ -6,6 +6,7 @@ use std::{
 use crate::core::{
     LogId,
     cbe::CBE64,
+    commit::LeafHashIndex,
     lsn::LSN,
     page::Page,
     page_count::PageCount,
@@ -43,6 +44,17 @@ impl MerkleHasher for Blake3Algorithm {
     fn hash(data: &[u8]) -> [u8; 32] {
         blake3::hash(data).into()
     }
+}
+
+/// Computes the leaf hash for a single page.
+///
+/// This is the canonical leaf hash used both when building the Merkle tree
+/// (in `CommitHashBuilder`) and when verifying individual pages on the read path.
+pub fn compute_leaf_hash(pageidx: PageIdx, page: &Page) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&pageidx.to_u32().to_be_bytes());
+    hasher.update(page.as_ref());
+    *hasher.finalize().as_bytes()
 }
 
 /// Errors that can occur when generating or deserializing a Merkle inclusion proof.
@@ -232,10 +244,7 @@ impl CommitHashBuilder {
             );
         }
 
-        let mut leaf_hasher = blake3::Hasher::new();
-        leaf_hasher.update(&pageidx.to_u32().to_be_bytes());
-        leaf_hasher.update(page.as_ref());
-        self.leaves.push(*leaf_hasher.finalize().as_bytes());
+        self.leaves.push(compute_leaf_hash(pageidx, page));
         self.leaf_page_indices.push(pageidx);
     }
 
@@ -284,6 +293,16 @@ impl CommitHashBuilder {
     /// Finalizes the hash computation and returns the `CommitHash`.
     pub fn build(self) -> CommitHash {
         self.build_inner().0
+    }
+
+    /// Finalizes the hash computation and returns the `CommitHash` plus a
+    /// `LeafHashIndex` mapping each page index to its leaf hash.
+    pub fn build_with_leaf_hashes(self) -> (CommitHash, LeafHashIndex) {
+        let (commit_hash, _tree, _root, leaves, indices, _metadata) = self.build_inner();
+        let entries: Vec<(PageIdx, [u8; 32])> =
+            indices.into_iter().zip(leaves.into_iter()).collect();
+        let leaf_hashes = LeafHashIndex::new(&entries);
+        (commit_hash, leaf_hashes)
     }
 
     /// Finalizes the hash computation and returns both the `CommitHash`

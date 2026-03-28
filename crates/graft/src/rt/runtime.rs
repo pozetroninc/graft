@@ -1,15 +1,15 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::core::{
-    LogId, PageCount, PageIdx, VolumeId, checksum::Checksum, commit::Commit, logref::LogRef,
-    lsn::LSN, page::Page, pageset::PageSet,
+    LogId, PageCount, PageIdx, VolumeId, checksum::Checksum, commit::Commit,
+    commit_hash::compute_leaf_hash, logref::LogRef, lsn::LSN, page::Page, pageset::PageSet,
 };
 use bytestring::ByteString;
 use tracing::Instrument;
 use tryiter::TryIteratorExt;
 
 use crate::{
-    GraftErr,
+    GraftErr, LogicalErr,
     remote::Remote,
     rt::{
         action::{Action, FetchLog, FetchSegment, HydrateSnapshot, RemoteCommit},
@@ -73,6 +73,18 @@ impl Runtime {
                 .expect("BUG: commit claims to contain pageidx");
 
             if let Some(page) = reader.read_page(idx.sid().clone(), pageidx)? {
+                if let Some(expected) = commit.leaf_hashes.get(pageidx) {
+                    let actual = compute_leaf_hash(pageidx, &page);
+                    if actual != expected {
+                        return Err(LogicalErr::PageIntegrity {
+                            sid: idx.sid().clone(),
+                            pageidx,
+                            expected,
+                            actual,
+                        }
+                        .into());
+                    }
+                }
                 return Ok(page);
             }
 
@@ -82,7 +94,10 @@ impl Runtime {
                 .expect("BUG: no frame for pageidx");
 
             // fetch the segment frame containing the page
-            self.run_action(FetchSegment { range })?;
+            self.run_action(FetchSegment {
+                range,
+                leaf_hashes: commit.leaf_hashes.clone(),
+            })?;
 
             // now that we've fetched the segment, read the page again using a
             // fresh storage reader

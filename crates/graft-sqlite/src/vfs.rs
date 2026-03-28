@@ -79,7 +79,9 @@ impl ErrCtx {
                 LogicalErr::VolumeConcurrentWrite(_) => SQLITE_BUSY_SNAPSHOT,
                 LogicalErr::VolumeNeedsRecovery(_)
                 | LogicalErr::VolumeDiverged(_)
-                | LogicalErr::VolumeRemoteMismatch { .. } => SQLITE_INTERNAL,
+                | LogicalErr::VolumeRemoteMismatch { .. }
+                | LogicalErr::PageIntegrity { .. }
+                | LogicalErr::MissingLeafHashes { .. } => SQLITE_INTERNAL,
             },
         }
     }

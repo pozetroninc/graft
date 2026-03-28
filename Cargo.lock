@@ -1077,6 +1077,7 @@ name = "graft-test"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "file-lock",
  "graft",
@@ -1087,6 +1088,7 @@ dependencies = [
  "rand 0.10.0",
  "rusqlite",
  "sqlite-plugin",
+ "static_assertions",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",

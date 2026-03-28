@@ -43,6 +43,16 @@ impl Action for FetchLog {
         let mut checkpoints = HashSet::new();
 
         // fetch missing lsns
+        // TODO(merkle): Enforce leaf_hash trust boundary here. FetchLog operates
+        // at the log level without Volume access, so it cannot currently check
+        // Volume.leaf_hash_min_lsn. The trust boundary check should be wired
+        // through either by:
+        // 1. Passing leaf_hash_min_lsn into FetchLog, or
+        // 2. Checking in fjall_storage when commits are stored/applied to a volume.
+        // When implemented: if leaf_hash_min_lsn is Some(min) and commit.lsn >= min
+        // and commit.leaf_hashes.is_empty(), reject with LogicalErr::MissingLeafHashes.
+        // Also: if leaf_hash_min_lsn is None and !commit.leaf_hashes.is_empty(),
+        // set leaf_hash_min_lsn = Some(commit.lsn).
         let mut commits = remote.stream_commits_ordered(&self.log, missing_lsns);
         while let Some(commit) = commits.try_next().await? {
             seen_lsns.insert(commit.lsn);

@@ -1,4 +1,5 @@
-use crate::core::{LogId, VolumeId};
+use crate::core::{LogId, PageIdx, SegmentId, VolumeId};
+use crate::core::lsn::LSN;
 use crate::{local::fjall_storage::FjallStorageErr, remote::RemoteErr};
 
 #[derive(Debug, thiserror::Error)]
@@ -43,5 +44,24 @@ pub enum LogicalErr {
         vid: VolumeId,
         expected: LogId,
         actual: LogId,
+    },
+
+    #[error(
+        "Page integrity check failed for segment {sid} page {pageidx}: expected {expected:02x?}, got {actual:02x?}"
+    )]
+    PageIntegrity {
+        sid: SegmentId,
+        pageidx: PageIdx,
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+
+    #[error(
+        "Missing leaf hashes on log {log} at LSN {lsn}; leaf hashes required since LSN {min_lsn}"
+    )]
+    MissingLeafHashes {
+        log: LogId,
+        lsn: LSN,
+        min_lsn: LSN,
     },
 }

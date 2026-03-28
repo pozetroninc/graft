@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
+use tryiter::TryIteratorExt;
 
 use crate::{
     GraftErr,
+    core::{SegmentId, commit::LeafHashIndex},
     local::fjall_storage::FjallStorage,
     remote::Remote,
     rt::action::{Action, fetch_segment::FetchSegment},
@@ -21,7 +24,21 @@ pub struct HydrateSnapshot {
 
 impl Action for HydrateSnapshot {
     async fn run(self, storage: Arc<FjallStorage>, remote: Arc<Remote>) -> Result<(), GraftErr> {
-        let missing_frames = storage.read().find_missing_frames(&self.snapshot)?;
+        let reader = storage.read();
+        let missing_frames = reader.find_missing_frames(&self.snapshot)?;
+
+        // Build a map from SegmentId -> LeafHashIndex by iterating commits
+        // in the snapshot so we can pass leaf hashes to each FetchSegment.
+        let mut leaf_hash_map: HashMap<SegmentId, LeafHashIndex> = HashMap::new();
+        let mut commits = reader.commits(&self.snapshot);
+        while let Some(commit) = commits.try_next()? {
+            if !commit.leaf_hashes.is_empty() {
+                if let Some(idx) = &commit.segment_idx {
+                    leaf_hash_map.insert(idx.sid.clone(), commit.leaf_hashes.clone());
+                }
+            }
+        }
+
         futures::stream::iter(
             missing_frames
                 .into_iter()
@@ -30,7 +47,11 @@ impl Action for HydrateSnapshot {
         )
         .map(Ok)
         .try_for_each_concurrent(HYDRATE_CONCURRENCY, |range| {
-            FetchSegment { range }.run(storage.clone(), remote.clone())
+            let leaf_hashes = leaf_hash_map
+                .get(&range.sid)
+                .cloned()
+                .unwrap_or_default();
+            FetchSegment { range, leaf_hashes }.run(storage.clone(), remote.clone())
         })
         .await
     }

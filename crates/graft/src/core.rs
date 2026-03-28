@@ -17,8 +17,10 @@ pub mod hash_table;
 pub mod merge_runs;
 pub mod zerocopy_ext;
 
+pub use commit::LeafHashIndex;
 pub use commit_hash::{
-    CommitHashBuilder, CommitHashParseErr, CommitMerkleTree, MerkleInclusionProof, MerkleProofError,
+    CommitHashBuilder, CommitHashParseErr, CommitMerkleTree, MerkleInclusionProof,
+    MerkleProofError, compute_leaf_hash,
 };
 pub use gid::{LogId, SegmentId, VolumeId};
 pub use page_count::PageCount;

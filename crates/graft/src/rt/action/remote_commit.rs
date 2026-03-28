@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, ops::RangeInclusive, sync::Arc};
 
 use crate::core::{
     CommitHashBuilder, LogId, PageCount, PageIdx, SegmentId, VolumeId,
-    commit::{Commit, SegmentIdx},
+    commit::{Commit, LeafHashIndex, SegmentIdx},
     commit_hash::CommitHash,
     logref::LogRef,
     lsn::LSN,
@@ -42,7 +42,7 @@ impl Action for RemoteCommit {
         tracing::debug!(?plan, "RemoteCommit plan");
 
         // build & upload segment
-        let (commit_hash, segment_idx, segment_chunks) = {
+        let (commit_hash, leaf_hashes, segment_idx, segment_chunks) = {
             let plan = plan.clone();
             let storage = storage.clone();
             spawn_blocking(move || build_segment(storage, plan))
@@ -93,7 +93,8 @@ impl Action for RemoteCommit {
         )
         .with_commit_hash(Some(commit_hash.clone()))
         .with_segment_idx(Some(segment_idx))
-        .with_checkpoints(maybe_checkpoint);
+        .with_checkpoints(maybe_checkpoint)
+        .with_leaf_hashes(leaf_hashes);
 
         #[cfg(feature = "precept")]
         precept::sometimes_fault!(
@@ -217,7 +218,7 @@ fn plan_commit(storage: &FjallStorage, vid: &VolumeId) -> Result<Option<CommitPl
 fn build_segment(
     storage: Arc<FjallStorage>,
     plan: CommitPlan,
-) -> Result<(CommitHash, SegmentIdx, Vec<Bytes>), GraftErr> {
+) -> Result<(CommitHash, LeafHashIndex, SegmentIdx, Vec<Bytes>), GraftErr> {
     let reader = storage.read();
 
     // built a snapshot which only matches the LSNs we want to
@@ -300,13 +301,13 @@ fn build_segment(
         batch.write_page(sid.clone(), pageidx, page);
     }
 
-    let commit_hash = commithash_builder.build();
+    let (commit_hash, leaf_hashes) = commithash_builder.build_with_leaf_hashes();
     let (frames, chunks) = segment_builder.finish();
     let idx = SegmentIdx::new(sid, pageset.into()).with_frames(frames);
 
     batch.commit()?;
 
-    Ok((commit_hash, idx, chunks))
+    Ok((commit_hash, leaf_hashes, idx, chunks))
 }
 
 /// Attempts to recover from a remote commit conflict by checking the remote
