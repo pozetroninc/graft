@@ -200,7 +200,19 @@ impl Runtime {
     /// fetches the latest changes to the remote and then pulls them into the volume
     pub fn volume_pull(&self, vid: VolumeId) -> Result<()> {
         let volume = self.inner.storage.read().volume(&vid)?;
-        self.fetch_log(volume.remote, None, volume.leaf_hash_min_lsn)?;
+        self.fetch_log(volume.remote.clone(), None, volume.leaf_hash_min_lsn)?;
+
+        // Persist the trust-on-first-use boundary if not already set.
+        // Scan the remote log for the first commit with leaf hashes.
+        if volume.leaf_hash_min_lsn.is_none() {
+            let reader = self.storage().read();
+            if let Some(first_lsn) = reader.first_lsn_with_leaf_hashes(&volume.remote)? {
+                self.storage()
+                    .read_write()
+                    .set_leaf_hash_min_lsn(&vid, first_lsn)?;
+            }
+        }
+
         if volume.pending_commit.is_some() {
             self.storage().read_write().recover_pending_commit(&vid)?;
         }

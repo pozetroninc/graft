@@ -115,6 +115,26 @@ derive_newtype_proxy!(
         if proxy.len() % LEAF_HASH_ENTRY_SIZE != 0 {
             return Err(bilrost::DecodeErrorKind::InvalidValue);
         }
+        // Validate entries are strictly sorted by PageIdx. An unsorted index
+        // would cause binary search to silently miss entries, bypassing
+        // per-page integrity checks.
+        let entry_count = proxy.len() / LEAF_HASH_ENTRY_SIZE;
+        let mut prev_pidx: Option<u32> = None;
+        for i in 0..entry_count {
+            let offset = i * LEAF_HASH_ENTRY_SIZE;
+            let pidx = u32::from_be_bytes([
+                proxy[offset],
+                proxy[offset + 1],
+                proxy[offset + 2],
+                proxy[offset + 3],
+            ]);
+            if let Some(prev) = prev_pidx {
+                if pidx <= prev {
+                    return Err(bilrost::DecodeErrorKind::InvalidValue);
+                }
+            }
+            prev_pidx = Some(pidx);
+        }
         *self = LeafHashIndex { data: proxy };
         Ok(())
     }
