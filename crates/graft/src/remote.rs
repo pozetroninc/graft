@@ -1,4 +1,4 @@
-use std::{future, ops::Range, time::Duration};
+use std::{future, ops::Range, path::PathBuf, time::Duration};
 
 use crate::core::{LogId, SegmentId, cbe::CBE64, commit::Commit, lsn::LSN};
 use bilrost::{Message, OwnedMessage};
@@ -52,6 +52,9 @@ pub enum RemoteErr {
 
     #[error("Failed to decode file: {0}")]
     Decode(#[from] bilrost::DecodeError),
+
+    #[error("Certificate file error: {0}")]
+    CertIo(#[from] std::io::Error),
 }
 
 impl RemoteErr {
@@ -96,6 +99,15 @@ pub enum RemoteConfig {
         bucket: String,
         prefix: Option<String>,
     },
+
+    /// HTTP gateway backed by an S3-compatible store, authenticated via mTLS
+    HttpGateway {
+        endpoint: String,
+        bucket: String,
+        #[serde(default)]
+        prefix: Option<String>,
+        cert_dir: PathBuf,
+    },
 }
 
 impl RemoteConfig {
@@ -129,7 +141,49 @@ impl Remote {
                     // enable hickory DNS resolver for DNS caching
                     .hickory_dns(true)
                     .connect_timeout(Duration::from_secs(5))
-                    .tcp_user_timeout(Duration::from_secs(60))
+                    .timeout(Duration::from_secs(60))
+                    .build()?;
+
+                Operator::new(builder)?
+                    .layer(HttpClientLayer::new(HttpClient::with(client)))
+                    .layer(RetryLayer::new())
+                    .finish()
+            }
+            RemoteConfig::HttpGateway {
+                endpoint,
+                bucket,
+                prefix,
+                cert_dir,
+            } => {
+                let mut builder = S3::default()
+                    .bucket(&bucket)
+                    .endpoint(&endpoint)
+                    .disable_config_load()
+                    .disable_ec2_metadata()
+                    .allow_anonymous();
+
+                if let Some(prefix) = prefix {
+                    builder = builder.root(&prefix);
+                }
+
+                // Load mTLS certificates from cert_dir
+                let ca_pem = std::fs::read(cert_dir.join("ca.pem"))?;
+                let cert_pem = std::fs::read(cert_dir.join("cert.pem"))?;
+                let key_pem = std::fs::read(cert_dir.join("key.pem"))?;
+
+                let ca = reqwest::tls::Certificate::from_pem(&ca_pem)?;
+
+                let mut identity_pem = cert_pem;
+                identity_pem.extend_from_slice(&key_pem);
+                let identity = reqwest::Identity::from_pem(&identity_pem)?;
+
+                let client = reqwest::ClientBuilder::new()
+                    .http1_only()
+                    .hickory_dns(true)
+                    .connect_timeout(Duration::from_secs(5))
+                    .timeout(Duration::from_secs(60))
+                    .add_root_certificate(ca)
+                    .identity(identity)
                     .build()?;
 
                 Operator::new(builder)?
@@ -315,5 +369,55 @@ impl Remote {
             })
             .unwrap()
             .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_http_gateway_config_deserialize() {
+        let toml_str = r#"
+            type = "http_gateway"
+            endpoint = "https://proxy.example.com:8443"
+            bucket = "my-bucket"
+            prefix = "users/alice"
+            cert_dir = "/etc/certs"
+        "#;
+
+        let config: RemoteConfig = toml::from_str(toml_str).unwrap();
+        match config {
+            RemoteConfig::HttpGateway {
+                endpoint,
+                bucket,
+                prefix,
+                cert_dir,
+            } => {
+                assert_eq!(endpoint, "https://proxy.example.com:8443");
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(prefix.as_deref(), Some("users/alice"));
+                assert_eq!(cert_dir, PathBuf::from("/etc/certs"));
+            }
+            other => panic!("expected HttpGateway, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_http_gateway_config_optional_prefix() {
+        let toml_str = r#"
+            type = "http_gateway"
+            endpoint = "https://proxy.example.com:8443"
+            bucket = "my-bucket"
+            cert_dir = "/etc/certs"
+        "#;
+
+        let config: RemoteConfig = toml::from_str(toml_str).unwrap();
+        match config {
+            RemoteConfig::HttpGateway { prefix, .. } => {
+                assert!(prefix.is_none());
+            }
+            other => panic!("expected HttpGateway, got {other:?}"),
+        }
     }
 }
