@@ -11,6 +11,9 @@ use graft::{
 };
 use graft_test::GraftTestRuntime;
 
+// Required by the lsn! and pageidx! macros.
+extern crate static_assertions;
+
 #[test]
 fn test_merkle_proof_after_push_pull() -> anyhow::Result<()> {
     graft_test::ensure_test_env();
