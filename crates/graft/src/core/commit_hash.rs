@@ -45,6 +45,17 @@ impl MerkleHasher for Blake3Algorithm {
     }
 }
 
+/// Errors that can occur when generating or deserializing a Merkle inclusion proof.
+#[derive(Error, Debug)]
+pub enum MerkleProofError {
+    #[error("cannot generate proof for empty tree")]
+    EmptyTree,
+    #[error("page index {0} not found in tree")]
+    PageNotFound(PageIdx),
+    #[error("proof deserialization failed: {0}")]
+    Deserialize(String),
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum CommitHashParseErr {
     #[error("invalid base58 encoding")]
@@ -229,25 +240,27 @@ impl CommitHashBuilder {
     }
 
     /// Internal method that computes the Merkle tree and commit hash.
+    ///
+    /// Constructs the tree once and reuses it, using the EMPTY_MERKLE sentinel
+    /// as the root for empty trees.
     #[allow(clippy::type_complexity)]
     fn build_inner(
         self,
     ) -> (
         CommitHash,
         MerkleTree<Blake3Algorithm>,
+        [u8; 32],
         Vec<[u8; 32]>,
         Vec<PageIdx>,
         Vec<u8>,
     ) {
+        let tree = MerkleTree::<Blake3Algorithm>::from_leaves(&self.leaves);
+
         let merkle_root: [u8; 32] = if self.leaves.is_empty() {
             blake3::hash(b"EMPTY_MERKLE").into()
         } else {
-            MerkleTree::<Blake3Algorithm>::from_leaves(&self.leaves)
-                .root()
-                .expect("non-empty tree must have root")
+            tree.root().expect("non-empty tree must have root")
         };
-
-        let tree = MerkleTree::<Blake3Algorithm>::from_leaves(&self.leaves);
 
         let mut final_hasher = blake3::Hasher::new();
         final_hasher.update(&self.metadata_bytes);
@@ -261,6 +274,7 @@ impl CommitHashBuilder {
         (
             commit_hash,
             tree,
+            merkle_root,
             self.leaves,
             self.leaf_page_indices,
             self.metadata_bytes,
@@ -275,11 +289,12 @@ impl CommitHashBuilder {
     /// Finalizes the hash computation and returns both the `CommitHash`
     /// and a `CommitMerkleTree` for generating inclusion proofs.
     pub fn build_with_tree(self) -> (CommitHash, CommitMerkleTree) {
-        let (hash, tree, leaves, indices, metadata_bytes) = self.build_inner();
+        let (hash, tree, merkle_root, leaves, indices, metadata_bytes) = self.build_inner();
         (
             hash,
             CommitMerkleTree {
                 tree,
+                merkle_root,
                 leaves,
                 leaf_page_indices: indices,
                 metadata_bytes,
@@ -291,15 +306,16 @@ impl CommitHashBuilder {
 /// A Merkle tree built from a commit's pages, used to generate inclusion proofs.
 pub struct CommitMerkleTree {
     tree: MerkleTree<Blake3Algorithm>,
+    merkle_root: [u8; 32],
     leaves: Vec<[u8; 32]>,
     leaf_page_indices: Vec<PageIdx>,
     metadata_bytes: Vec<u8>,
 }
 
 impl CommitMerkleTree {
-    /// Returns the Merkle root hash.
-    pub fn root(&self) -> Option<[u8; 32]> {
-        self.tree.root()
+    /// Returns the Merkle root hash (including the EMPTY_MERKLE sentinel for empty trees).
+    pub fn root(&self) -> [u8; 32] {
+        self.merkle_root
     }
 
     /// Returns the total number of leaves in the tree.
@@ -315,25 +331,30 @@ impl CommitMerkleTree {
     /// Generates a Merkle inclusion proof for the given page indices.
     ///
     /// Returns an error if any of the requested page indices are not in the tree.
-    pub fn proof(&self, page_indices: &[PageIdx]) -> Result<MerkleInclusionProof, String> {
+    pub fn proof(
+        &self,
+        page_indices: &[PageIdx],
+    ) -> Result<MerkleInclusionProof, MerkleProofError> {
         if self.leaves.is_empty() {
-            return Err("cannot generate proof for empty tree".to_string());
+            return Err(MerkleProofError::EmptyTree);
         }
 
-        // Map PageIdx -> leaf position
-        let mut positions: Vec<usize> = Vec::with_capacity(page_indices.len());
+        // Map PageIdx -> leaf position using binary search (leaf_page_indices is sorted)
+        let mut paired: Vec<(usize, PageIdx)> = Vec::with_capacity(page_indices.len());
         for pidx in page_indices {
             let pos = self
                 .leaf_page_indices
-                .iter()
-                .position(|p| p == pidx)
-                .ok_or_else(|| format!("page index {pidx} not found in tree"))?;
-            positions.push(pos);
+                .binary_search(pidx)
+                .map_err(|_| MerkleProofError::PageNotFound(*pidx))?;
+            paired.push((pos, *pidx));
         }
 
-        // Sort and deduplicate (rs-merkle requires sorted indices)
-        positions.sort_unstable();
-        positions.dedup();
+        // Sort and deduplicate by position (rs-merkle requires sorted indices)
+        paired.sort_unstable_by_key(|(pos, _)| *pos);
+        paired.dedup_by_key(|(pos, _)| *pos);
+
+        let (positions, leaf_page_indices): (Vec<usize>, Vec<PageIdx>) =
+            paired.into_iter().unzip();
 
         let proof = self.tree.proof(&positions);
         let proof_bytes = proof.to_bytes();
@@ -341,6 +362,7 @@ impl CommitMerkleTree {
         Ok(MerkleInclusionProof {
             proof_bytes,
             leaf_positions: positions,
+            leaf_page_indices,
             total_leaves: self.leaves.len(),
         })
     }
@@ -351,6 +373,7 @@ impl CommitMerkleTree {
 pub struct MerkleInclusionProof {
     proof_bytes: Vec<u8>,
     leaf_positions: Vec<usize>,
+    leaf_page_indices: Vec<PageIdx>,
     total_leaves: usize,
 }
 
@@ -365,42 +388,23 @@ impl MerkleInclusionProof {
         metadata: &CommitMetadata,
         page_entries: &[(PageIdx, &Page)],
     ) -> bool {
-        // Reconstruct leaf hashes in the same order as leaf_positions
-        // First, build a map from PageIdx to leaf hash
-        let mut leaf_hashes_by_pos: Vec<(usize, [u8; 32])> = Vec::with_capacity(page_entries.len());
-
-        for (pageidx, page) in page_entries {
-            // We need to figure out which position this page corresponds to.
-            // The caller should provide pages in an order matching the proof's leaf_positions,
-            // but we match by computing all leaf hashes and pairing them.
-            let mut leaf_hasher = blake3::Hasher::new();
-            leaf_hasher.update(&pageidx.to_u32().to_be_bytes());
-            leaf_hasher.update(page.as_ref());
-            let leaf_hash = *leaf_hasher.finalize().as_bytes();
-
-            // Find the corresponding position in leaf_positions
-            // We need to try to find a position that hasn't been used yet
-            let mut found = false;
-            for &pos in &self.leaf_positions {
-                if !leaf_hashes_by_pos.iter().any(|(p, _)| *p == pos) {
-                    leaf_hashes_by_pos.push((pos, leaf_hash));
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                return false;
-            }
-        }
-
-        if leaf_hashes_by_pos.len() != self.leaf_positions.len() {
+        if page_entries.len() != self.leaf_page_indices.len() {
             return false;
         }
 
-        // Sort by position to match the proof's expected order
-        leaf_hashes_by_pos.sort_by_key(|(pos, _)| *pos);
-
-        let leaf_hashes: Vec<[u8; 32]> = leaf_hashes_by_pos.into_iter().map(|(_, h)| h).collect();
+        // Reconstruct leaf hashes ordered by the proof's leaf_page_indices (which are
+        // sorted by position). Match page entries by PageIdx for deterministic ordering.
+        let mut leaf_hashes: Vec<[u8; 32]> = Vec::with_capacity(self.leaf_page_indices.len());
+        for expected_pidx in &self.leaf_page_indices {
+            let Some((_pidx, page)) = page_entries.iter().find(|(pidx, _)| pidx == expected_pidx)
+            else {
+                return false;
+            };
+            let mut leaf_hasher = blake3::Hasher::new();
+            leaf_hasher.update(&expected_pidx.to_u32().to_be_bytes());
+            leaf_hasher.update(page.as_ref());
+            leaf_hashes.push(*leaf_hasher.finalize().as_bytes());
+        }
 
         // Deserialize the proof
         let proof = match rs_merkle::MerkleProof::<Blake3Algorithm>::try_from(
@@ -443,9 +447,10 @@ impl MerkleInclusionProof {
         // number of leaf positions as u32
         out.extend_from_slice(&(self.leaf_positions.len() as u32).to_be_bytes());
 
-        // each leaf position as u32
-        for &pos in &self.leaf_positions {
+        // each (leaf position as u32, page index as u32) pair
+        for (&pos, pidx) in self.leaf_positions.iter().zip(&self.leaf_page_indices) {
             out.extend_from_slice(&(pos as u32).to_be_bytes());
+            out.extend_from_slice(&pidx.to_u32().to_be_bytes());
         }
 
         // proof bytes length as u32
@@ -458,9 +463,11 @@ impl MerkleInclusionProof {
     }
 
     /// Deserializes a proof from bytes.
-    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(data: &[u8]) -> Result<Self, MerkleProofError> {
         if data.len() < 8 {
-            return Err("proof data too short".to_string());
+            return Err(MerkleProofError::Deserialize(
+                "proof data too short".to_string(),
+            ));
         }
 
         let mut offset = 0;
@@ -473,22 +480,34 @@ impl MerkleInclusionProof {
             u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
-        if data.len() < offset + num_positions * 4 + 4 {
-            return Err("proof data too short for positions".to_string());
+        // Each entry is a (u32 position, u32 page_idx) pair = 8 bytes
+        if data.len() < offset + num_positions * 8 + 4 {
+            return Err(MerkleProofError::Deserialize(
+                "proof data too short for positions".to_string(),
+            ));
         }
 
         let mut leaf_positions = Vec::with_capacity(num_positions);
+        let mut leaf_page_indices = Vec::with_capacity(num_positions);
         for _ in 0..num_positions {
             let pos = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
+            let pidx_raw = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            let pidx = PageIdx::try_new(pidx_raw).ok_or_else(|| {
+                MerkleProofError::Deserialize(format!("invalid page index: {pidx_raw}"))
+            })?;
             leaf_positions.push(pos);
+            leaf_page_indices.push(pidx);
         }
 
         let proof_len = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
         if data.len() < offset + proof_len {
-            return Err("proof data too short for proof bytes".to_string());
+            return Err(MerkleProofError::Deserialize(
+                "proof data too short for proof bytes".to_string(),
+            ));
         }
 
         let proof_bytes = data[offset..offset + proof_len].to_vec();
@@ -496,6 +515,7 @@ impl MerkleInclusionProof {
         Ok(Self {
             proof_bytes,
             leaf_positions,
+            leaf_page_indices,
             total_leaves,
         })
     }

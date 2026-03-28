@@ -18,7 +18,7 @@ pub mod merge_runs;
 pub mod zerocopy_ext;
 
 pub use commit_hash::{
-    CommitHashBuilder, CommitHashParseErr, CommitMerkleTree, MerkleInclusionProof,
+    CommitHashBuilder, CommitHashParseErr, CommitMerkleTree, MerkleInclusionProof, MerkleProofError,
 };
 pub use gid::{LogId, SegmentId, VolumeId};
 pub use page_count::PageCount;
