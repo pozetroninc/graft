@@ -2,7 +2,8 @@ use std::{sync::Arc, time::Duration};
 
 use crate::core::{
     LogId, PageCount, PageIdx, VolumeId, checksum::Checksum, commit::Commit,
-    commit_hash::compute_leaf_hash, logref::LogRef, lsn::LSN, page::Page, pageset::PageSet,
+    commit_hash::{CommitHashBuilder, compute_leaf_hash}, logref::LogRef, lsn::LSN, page::Page,
+    pageset::PageSet,
 };
 use bytestring::ByteString;
 use tracing::Instrument;
@@ -89,7 +90,12 @@ impl Runtime {
                     }
                     .into());
                 }
-                if let Some(expected) = commit.leaf_hashes.get(pageidx) {
+                if !commit.leaf_hashes.is_empty() {
+                    let expected =
+                        commit.leaf_hashes.get(pageidx).ok_or_else(|| LogicalErr::MissingLeafHash {
+                            sid: idx.sid().clone(),
+                            pageidx,
+                        })?;
                     let actual = compute_leaf_hash(pageidx, &page);
                     if actual != expected {
                         return Err(LogicalErr::PageIntegrity {
@@ -320,7 +326,65 @@ impl Runtime {
     }
 
     pub fn snapshot_hydrate(&self, snapshot: Snapshot) -> Result<()> {
-        self.run_action(HydrateSnapshot { snapshot })
+        self.run_action(HydrateSnapshot {
+            snapshot: snapshot.clone(),
+        })?;
+
+        // After hydration, verify commit hashes for all commits in the snapshot.
+        // This catches any tampering with the integrity chain by a compromised remote.
+        self.verify_snapshot_commit_hashes(&snapshot)?;
+        Ok(())
+    }
+
+    /// Verifies all commit hashes in the snapshot by recomputing them from page data.
+    ///
+    /// For each commit that has a `commit_hash` and a `segment_idx`, rebuilds the
+    /// `CommitHashBuilder` from the stored pages and compares the recomputed hash
+    /// against the stored one.
+    pub fn verify_snapshot_commit_hashes(&self, snapshot: &Snapshot) -> Result<()> {
+        let reader = self.storage().read();
+
+        for commit_result in reader.commits(snapshot) {
+            let commit = commit_result?;
+            let (Some(commit_hash), Some(segment_idx)) =
+                (commit.commit_hash.as_ref(), commit.segment_idx.as_ref())
+            else {
+                continue;
+            };
+
+            let commit_pages = segment_idx.pageset().cardinality();
+            let mut builder = CommitHashBuilder::new(
+                commit.log.clone(),
+                commit.lsn,
+                commit.page_count,
+                commit_pages,
+            );
+
+            for pidx in segment_idx.pageset().iter() {
+                let page = reader
+                    .read_page(segment_idx.sid().clone(), pidx)?
+                    .ok_or_else(|| {
+                        LogicalErr::PageNotFound {
+                            sid: segment_idx.sid().clone(),
+                            pageidx: pidx,
+                        }
+                    })?;
+                builder.write_page(pidx, &page);
+            }
+
+            let recomputed = builder.build();
+            if &recomputed != commit_hash {
+                return Err(LogicalErr::CommitHashMismatch {
+                    log: commit.log.clone(),
+                    lsn: commit.lsn,
+                    expected: commit_hash.clone(),
+                    actual: recomputed,
+                }
+                .into());
+            }
+        }
+
+        Ok(())
     }
 }
 

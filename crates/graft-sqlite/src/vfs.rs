@@ -81,7 +81,10 @@ impl ErrCtx {
                 | LogicalErr::VolumeDiverged(_)
                 | LogicalErr::VolumeRemoteMismatch { .. }
                 | LogicalErr::PageIntegrity { .. }
-                | LogicalErr::MissingLeafHashes { .. } => SQLITE_INTERNAL,
+                | LogicalErr::MissingLeafHashes { .. }
+                | LogicalErr::MissingLeafHash { .. }
+                | LogicalErr::CommitHashMismatch { .. }
+                | LogicalErr::PageNotFound { .. } => SQLITE_INTERNAL,
             },
         }
     }

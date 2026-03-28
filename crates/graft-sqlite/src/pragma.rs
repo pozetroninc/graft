@@ -431,6 +431,9 @@ fn format_volume_audit(runtime: &Runtime, file: &VolFile) -> Result<String, ErrC
     let missing_pages = runtime.snapshot_missing_pages(&snapshot)?;
     let pages = file.page_count()?.to_usize();
     if missing_pages.is_empty() {
+        // Volume is fully hydrated — verify commit hashes
+        runtime.verify_snapshot_commit_hashes(&snapshot)?;
+
         let checksum = runtime.snapshot_checksum(&snapshot)?;
         Ok(formatdoc!(
             "

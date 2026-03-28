@@ -94,6 +94,28 @@ impl Action for FetchLog {
         if !checkpoints.is_empty() {
             let mut commits = remote.stream_commits_ordered(&self.log, checkpoints);
             while let Some(commit) = commits.try_next().await? {
+                // Apply same trust boundary check as the main loop
+                if let Some(min_lsn) = leaf_hash_min {
+                    if commit.lsn >= min_lsn && commit.leaf_hashes.is_empty() {
+                        return Err(LogicalErr::MissingLeafHashes {
+                            log: self.log.clone(),
+                            lsn: commit.lsn,
+                            min_lsn,
+                        }
+                        .into());
+                    }
+                }
+
+                // Establish boundary on first commit with leaf hashes
+                if leaf_hash_min.is_none() && !commit.leaf_hashes.is_empty() {
+                    leaf_hash_min = Some(commit.lsn);
+                }
+
+                // In-band enforcement
+                if commit.leaf_hashes_required && leaf_hash_min.is_none() {
+                    leaf_hash_min = Some(commit.lsn);
+                }
+
                 batch.write_commit(commit);
             }
         }

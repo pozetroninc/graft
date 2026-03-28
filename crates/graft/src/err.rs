@@ -1,4 +1,5 @@
 use crate::core::{LogId, PageIdx, SegmentId, VolumeId};
+use crate::core::commit_hash::CommitHash;
 use crate::core::lsn::LSN;
 use crate::{local::fjall_storage::FjallStorageErr, remote::RemoteErr};
 
@@ -63,5 +64,29 @@ pub enum LogicalErr {
         log: LogId,
         lsn: LSN,
         min_lsn: LSN,
+    },
+
+    #[error(
+        "Missing leaf hash for segment {sid} page {pageidx}: commit has leaf hashes but this page is not covered"
+    )]
+    MissingLeafHash {
+        sid: SegmentId,
+        pageidx: PageIdx,
+    },
+
+    #[error(
+        "Commit hash mismatch on log {log} at LSN {lsn}: expected {expected}, got {actual}"
+    )]
+    CommitHashMismatch {
+        log: LogId,
+        lsn: LSN,
+        expected: CommitHash,
+        actual: CommitHash,
+    },
+
+    #[error("Page not found for segment {sid} page {pageidx}")]
+    PageNotFound {
+        sid: SegmentId,
+        pageidx: PageIdx,
     },
 }

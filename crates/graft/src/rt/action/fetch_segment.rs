@@ -28,7 +28,13 @@ impl Action for FetchSegment {
         let pages = segment_frame_iter(&bytes);
         let mut batch = storage.batch();
         for (pageidx, page) in pageidxs.zip(pages) {
-            if let Some(expected) = self.leaf_hashes.get(pageidx) {
+            if !self.leaf_hashes.is_empty() {
+                let expected = self.leaf_hashes.get(pageidx).ok_or_else(|| {
+                    LogicalErr::MissingLeafHash {
+                        sid: self.range.sid.clone(),
+                        pageidx,
+                    }
+                })?;
                 let actual = compute_leaf_hash(pageidx, &page);
                 if actual != expected {
                     return Err(LogicalErr::PageIntegrity {
