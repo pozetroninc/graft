@@ -298,3 +298,98 @@ fn test_sqlite_corruption_detected_by_merkle_proof() -> anyhow::Result<()> {
     runtime.shutdown().unwrap();
     Ok(())
 }
+
+/// Writes data via SQLite, pushes (generating leaf hashes), pulls to a second
+/// node, then corrupts a page directly in fjall storage and reads through
+/// SQLite. The read-path verification should automatically detect the corruption.
+#[test]
+fn test_vfs_read_detects_corrupted_cached_page() {
+    graft_test::ensure_test_env();
+
+    let remote = LogId::random();
+
+    // Node 1: write data and push.
+    let mut runtime1 = GraftTestRuntime::with_memory_remote();
+    let sqlite1 = runtime1.open_sqlite("main", Some(remote.clone()));
+
+    sqlite1
+        .execute_batch(
+            r#"
+            PRAGMA journal_mode = MEMORY;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
+            "#,
+        )
+        .unwrap();
+
+    // Insert enough rows to create multiple pages.
+    for i in 0..100 {
+        sqlite1
+            .execute(
+                "INSERT INTO items VALUES (?1, ?2)",
+                rusqlite::params![i, "x".repeat(100)],
+            )
+            .unwrap();
+    }
+
+    sqlite1.graft_pragma("push").unwrap();
+
+    // Node 2: pull the data (fetches commits + pages into local storage).
+    let mut runtime2 = runtime1.spawn_peer();
+    let sqlite2 = runtime2.open_sqlite("main", Some(remote.clone()));
+    sqlite2.graft_pragma("pull").unwrap();
+
+    // First, read all data to populate the local page cache. This triggers
+    // FetchSegment which downloads clean pages from remote into fjall.
+    let count: i64 = sqlite2
+        .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 100, "should read 100 rows before corruption");
+
+    // Drop and re-open the SQLite connection to clear SQLite's internal page
+    // cache. The next read will go through the VFS again but pages are now
+    // in fjall's local cache (not remote).
+    drop(sqlite2);
+    let sqlite2 = runtime2.open_sqlite("main", Some(remote.clone()));
+
+    // Now corrupt page 2 — it's cached in fjall, so the next read will hit
+    // the cache-hit verification path (not FetchSegment).
+    let tag2 = runtime2.tag_get("main").unwrap().unwrap();
+    let snapshot2 = runtime2.volume_snapshot(&tag2).unwrap();
+    let pidx2 = graft::core::PageIdx::try_new(2).unwrap();
+    // Debug: check if the commit has leaf hashes
+    let volume2 = runtime2.volume_get(&tag2).unwrap();
+    let commit = runtime2.get_commit(&volume2.remote, graft::lsn!(1)).unwrap();
+    match &commit {
+        Some(c) => {
+            eprintln!(
+                "  commit LSN 1 has {} leaf hashes, has page 2 hash: {}",
+                c.leaf_hashes.len(),
+                c.leaf_hashes.get(pidx2).is_some()
+            );
+        }
+        None => eprintln!("  no commit at LSN 1"),
+    }
+
+    let corrupted = runtime2
+        .storage_for_test()
+        .corrupt_page(&snapshot2, pidx2, Page::test_filled(0xDE))
+        .unwrap();
+    assert!(corrupted, "page 2 should have been found and corrupted");
+    eprintln!("  corrupted page 2 in node 2's fjall storage BEFORE first read");
+
+    // Now try to read through SQLite. The VFS read path should detect the
+    // corruption via leaf hash verification and return an error.
+    let result = sqlite2.query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0));
+
+    assert!(
+        result.is_err(),
+        "SQLite read should fail due to corrupted page detected by Merkle verification"
+    );
+    eprintln!(
+        "  VFS read correctly detected corruption: {}",
+        result.unwrap_err()
+    );
+
+    runtime1.shutdown().unwrap();
+    runtime2.shutdown().unwrap();
+}

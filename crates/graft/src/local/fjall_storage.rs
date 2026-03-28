@@ -151,6 +151,26 @@ impl FjallStorage {
         self.ks.pages.insert(PageKey::new(sid, pageidx), page)
     }
 
+    /// Test-only: find the segment ID containing a page in a snapshot, then
+    /// overwrite it with the given page data. Returns true if the page was
+    /// found and corrupted.
+    #[cfg(feature = "testutil")]
+    pub fn corrupt_page(
+        &self,
+        snapshot: &crate::snapshot::Snapshot,
+        pageidx: PageIdx,
+        corrupt_page: Page,
+    ) -> Result<bool, FjallStorageErr> {
+        let reader = self.read();
+        if let Some(commit) = reader.search_page(snapshot, pageidx)? {
+            if let Some(idx) = commit.segment_idx() {
+                self.write_page(idx.sid().clone(), pageidx, corrupt_page)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn remove_page(&self, sid: SegmentId, pageidx: PageIdx) -> Result<(), FjallStorageErr> {
         self.ks.pages.remove(PageKey::new(sid, pageidx))
     }

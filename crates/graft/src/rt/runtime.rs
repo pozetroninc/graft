@@ -65,6 +65,12 @@ impl Runtime {
         &self.inner.storage
     }
 
+    /// Test-only: expose storage for page corruption tests.
+    #[cfg(feature = "testutil")]
+    pub fn storage_for_test(&self) -> &FjallStorage {
+        &self.inner.storage
+    }
+
     pub(crate) fn read_page(&self, snapshot: &Snapshot, pageidx: PageIdx) -> Result<Page> {
         let reader = self.storage().read();
         if let Some(commit) = reader.search_page(snapshot, pageidx)? {
