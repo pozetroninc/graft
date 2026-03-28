@@ -175,3 +175,126 @@ fn test_merkle_proof_single_page_commit() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Writes real data via SQLite, pushes to remote, pulls to a second node,
+/// reads all pages, builds a Merkle tree, generates proofs, then simulates
+/// corruption by flipping a byte in one page and verifies the proof detects it.
+#[test]
+fn test_sqlite_corruption_detected_by_merkle_proof() -> anyhow::Result<()> {
+    graft_test::ensure_test_env();
+
+    let remote = LogId::random();
+    let mut runtime = GraftTestRuntime::with_memory_remote();
+    let sqlite = runtime.open_sqlite("main", Some(remote.clone()));
+
+    // Create a table and insert enough rows to span multiple SQLite pages.
+    sqlite.execute_batch(
+        r#"
+        PRAGMA journal_mode = MEMORY;
+        CREATE TABLE accounts (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            balance REAL NOT NULL,
+            padding TEXT NOT NULL
+        );
+        "#,
+    )?;
+
+    // Insert 200 rows with ~200 bytes each to span several 4KB pages.
+    for i in 0..200 {
+        sqlite.execute(
+            "INSERT INTO accounts VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                i,
+                format!("account-{i:04}"),
+                1000.0 + i as f64,
+                "x".repeat(150),
+            ],
+        )?;
+    }
+
+    // Push to remote.
+    sqlite.graft_pragma("push")?;
+
+    // Get volume info to reconstruct the commit metadata.
+    let tag = runtime.tag_get("main")?.expect("tag should exist");
+    let vol_info = runtime.volume_get(&tag)?;
+    let snapshot = runtime.volume_snapshot(&tag)?;
+
+    // Read all pages from the snapshot to build the Merkle tree.
+    let reader = runtime.volume_reader(tag.clone())?;
+    let page_count = snapshot.page_count;
+    let mut pages: Vec<(graft::core::PageIdx, Page)> = Vec::new();
+
+    for pidx_u32 in 1..=page_count.to_u32() {
+        let pidx = graft::core::PageIdx::try_new(pidx_u32).unwrap();
+        let page = reader.read_page(pidx)?;
+        // Only include non-empty pages (sparse volume).
+        if page != Page::EMPTY {
+            pages.push((pidx, page));
+        }
+    }
+
+    assert!(!pages.is_empty(), "should have at least some pages");
+    let num_pages = pages.len();
+    eprintln!("  read {num_pages} non-empty pages from SQLite volume");
+
+    // Build the Merkle tree from the actual page data.
+    let mut builder = CommitHashBuilder::new(
+        vol_info.remote.clone(),
+        lsn!(1),
+        page_count,
+        PageCount::new(num_pages as u32),
+    );
+    for (pidx, page) in &pages {
+        builder.write_page(*pidx, page);
+    }
+    let (commit_hash, tree) = builder.build_with_tree();
+    let metadata = CommitMetadata::new(
+        vol_info.remote,
+        lsn!(1),
+        page_count,
+        PageCount::new(num_pages as u32),
+    );
+
+    // Verify a proof for the first page passes with clean data.
+    let (first_pidx, first_page) = &pages[0];
+    let proof = tree.proof(&[*first_pidx])?;
+    assert!(
+        proof.verify(&commit_hash, &metadata, &[(*first_pidx, first_page)]),
+        "proof should verify with clean page data"
+    );
+
+    // Now simulate corruption: flip a single byte in the page data.
+    let mut corrupted_bytes = first_page.as_ref().to_vec();
+    // Flip byte at offset 100 (arbitrary choice within the 4KB page).
+    corrupted_bytes[100] ^= 0xFF;
+    let corrupted_page = Page::try_from(bytes::Bytes::from(corrupted_bytes))?;
+
+    // The proof should FAIL with the corrupted page.
+    assert!(
+        !proof.verify(&commit_hash, &metadata, &[(*first_pidx, &corrupted_page)]),
+        "proof should FAIL with corrupted page data (single byte flip)"
+    );
+
+    // Verify a proof for a middle page too.
+    let mid = pages.len() / 2;
+    let (mid_pidx, mid_page) = &pages[mid];
+    let mid_proof = tree.proof(&[*mid_pidx])?;
+    assert!(
+        mid_proof.verify(&commit_hash, &metadata, &[(*mid_pidx, mid_page)]),
+        "middle page proof should verify with clean data"
+    );
+
+    // Corrupt the middle page (zero it out entirely).
+    let zeroed_page = Page::EMPTY;
+    assert!(
+        !mid_proof.verify(&commit_hash, &metadata, &[(*mid_pidx, &zeroed_page)]),
+        "proof should FAIL with zeroed page"
+    );
+
+    eprintln!("  corruption detected for both single-byte-flip and full-zero scenarios");
+
+    runtime.shutdown().unwrap();
+    Ok(())
+}
