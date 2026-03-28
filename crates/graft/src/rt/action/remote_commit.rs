@@ -333,6 +333,7 @@ async fn attempt_recovery(
         FetchLog {
             log: volume.remote.clone(),
             max_lsn: None,
+            leaf_hash_min_lsn: volume.leaf_hash_min_lsn,
         }
         .run(storage.clone(), remote.clone())
         .await?;

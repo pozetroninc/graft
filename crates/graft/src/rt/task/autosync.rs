@@ -1,6 +1,6 @@
-use std::{collections::HashSet, fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
-use crate::core::VolumeId;
+use crate::core::{VolumeId, lsn::LSN};
 use futures::stream::FuturesUnordered;
 use tokio::time::Interval;
 use tokio_stream::StreamExt;
@@ -47,8 +47,9 @@ impl Task for AutosyncTask {
                 Pull { vid: VolumeId },
             }
 
-            // a set of LogIds to fetch
-            let mut fetches = HashSet::new();
+            // Map of LogId -> leaf_hash_min_lsn for trust boundary enforcement.
+            // When multiple volumes share a log, use the earliest (most restrictive) boundary.
+            let mut fetches: HashMap<_, Option<LSN>> = HashMap::new();
             // a set of actions to execute
             let mut actions = vec![];
 
@@ -67,10 +68,12 @@ impl Task for AutosyncTask {
                     } else if remote_changes {
                         actions.push(Subtask::Pull { vid: volume.vid })
                     } else if local_changes {
-                        fetches.insert(volume.remote);
+                        let entry = fetches.entry(volume.remote).or_insert(None);
+                        *entry = merge_min_lsn(*entry, volume.leaf_hash_min_lsn);
                         actions.push(Subtask::Push { vid: volume.vid })
                     } else {
-                        fetches.insert(volume.remote);
+                        let entry = fetches.entry(volume.remote).or_insert(None);
+                        *entry = merge_min_lsn(*entry, volume.leaf_hash_min_lsn);
                         actions.push(Subtask::Pull { vid: volume.vid });
                     }
                 }
@@ -79,7 +82,14 @@ impl Task for AutosyncTask {
             // execute all scheduled fetches
             let mut futures: FuturesUnordered<_> = fetches
                 .into_iter()
-                .map(|log| FetchLog { log, max_lsn: None }.run(storage.clone(), remote.clone()))
+                .map(|(log, leaf_hash_min_lsn)| {
+                    FetchLog {
+                        log,
+                        max_lsn: None,
+                        leaf_hash_min_lsn,
+                    }
+                    .run(storage.clone(), remote.clone())
+                })
                 .collect();
             while let Some(result) = futures.next().await {
                 if let Err(err) = result {
@@ -109,5 +119,15 @@ impl Task for AutosyncTask {
                 }
             }
         }
+    }
+}
+
+/// Merge two optional LSN boundaries, keeping the most restrictive (earliest).
+fn merge_min_lsn(a: Option<LSN>, b: Option<LSN>) -> Option<LSN> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     }
 }

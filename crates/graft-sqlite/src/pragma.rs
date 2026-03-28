@@ -457,7 +457,8 @@ fn fetch_or_pull(runtime: &Runtime, file: &mut VolFile, pull: bool) -> Result<St
     if pull {
         runtime.volume_pull(file.vid.clone())?;
     } else {
-        runtime.fetch_log(pre.remote, None)?;
+        let volume = runtime.volume_get(&file.vid)?;
+        runtime.fetch_log(pre.remote, None, volume.leaf_hash_min_lsn)?;
     }
     let post = runtime.volume_status(&file.vid)?;
 

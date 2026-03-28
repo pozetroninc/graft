@@ -194,7 +194,7 @@ impl Runtime {
     /// fetches the latest changes to the remote and then pulls them into the volume
     pub fn volume_pull(&self, vid: VolumeId) -> Result<()> {
         let volume = self.inner.storage.read().volume(&vid)?;
-        self.fetch_log(volume.remote, None)?;
+        self.fetch_log(volume.remote, None, volume.leaf_hash_min_lsn)?;
         if volume.pending_commit.is_some() {
             self.storage().read_write().recover_pending_commit(&vid)?;
         }
@@ -233,8 +233,17 @@ impl Runtime {
 
 // log methods
 impl Runtime {
-    pub fn fetch_log(&self, log: LogId, max_lsn: Option<LSN>) -> Result<()> {
-        self.run_action(FetchLog { log, max_lsn })
+    pub fn fetch_log(
+        &self,
+        log: LogId,
+        max_lsn: Option<LSN>,
+        leaf_hash_min_lsn: Option<LSN>,
+    ) -> Result<()> {
+        self.run_action(FetchLog {
+            log,
+            max_lsn,
+            leaf_hash_min_lsn,
+        })
     }
 
     pub fn get_commit(&self, log: &LogId, lsn: LSN) -> Result<Option<Commit>> {
