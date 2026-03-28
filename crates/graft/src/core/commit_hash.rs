@@ -13,6 +13,7 @@ use crate::core::{
     zerocopy_ext::{self, ZerocopyErr},
 };
 use crate::derive_zerocopy_encoding;
+use rs_merkle::{Hasher as MerkleHasher, MerkleTree};
 use thiserror::Error;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
@@ -32,6 +33,17 @@ const COMMIT_HASH_MAGIC: [u8; 4] = [0x68, 0xA4, 0x19, 0x30];
 // This is currently guaranteed for well-constructed CommitHash's due to the
 // CommitHashPrefix occupying the most significant byte.
 const ENCODED_LEN: usize = 44;
+
+/// BLAKE3 hasher adapter for rs-merkle.
+#[derive(Clone)]
+pub struct Blake3Algorithm;
+
+impl MerkleHasher for Blake3Algorithm {
+    type Hash = [u8; 32];
+    fn hash(data: &[u8]) -> [u8; 32] {
+        blake3::hash(data).into()
+    }
+}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum CommitHashParseErr {
@@ -145,25 +157,55 @@ derive_zerocopy_encoding!(
     with empty (CommitHash::ZERO)
 );
 
-/// Builder for computing commit hashes using BLAKE3.
+/// Metadata needed to verify a Merkle inclusion proof against a commit hash.
+///
+/// Contains the same fields fed to `CommitHashBuilder::new()`:
+/// magic + `LogId` + LSN + `vol_pages` + `commit_pages`.
+#[derive(Clone, Debug)]
+pub struct CommitMetadata {
+    bytes: Vec<u8>,
+}
+
+impl CommitMetadata {
+    /// Build metadata bytes from the same parameters as `CommitHashBuilder::new()`.
+    pub fn new(log: LogId, lsn: LSN, vol_pages: PageCount, commit_pages: PageCount) -> Self {
+        let mut bytes = Vec::with_capacity(4 + 16 + 8 + 4 + 4);
+        bytes.extend_from_slice(&COMMIT_HASH_MAGIC);
+        bytes.extend_from_slice(log.as_bytes());
+        bytes.extend_from_slice(CBE64::from(lsn).as_bytes());
+        bytes.extend_from_slice(&vol_pages.to_u32().to_be_bytes());
+        bytes.extend_from_slice(&commit_pages.to_u32().to_be_bytes());
+        Self { bytes }
+    }
+
+    /// Returns the raw metadata bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Builder for computing commit hashes using a Merkle tree of BLAKE3 leaf hashes.
 ///
 /// The hash incorporates the Log ID, LSN, page count, and page data
-/// to ensure uniqueness and integrity verification.
+/// to ensure uniqueness and integrity verification. Each page becomes
+/// a leaf in the Merkle tree, enabling per-page inclusion proofs.
 pub struct CommitHashBuilder {
-    hasher: blake3::Hasher,
+    metadata_bytes: Vec<u8>,
+    leaves: Vec<[u8; 32]>,
+    leaf_page_indices: Vec<PageIdx>,
     last_pageidx: Option<PageIdx>,
 }
 
 impl CommitHashBuilder {
     /// Creates a new `CommitHashBuilder` initialized with the given metadata.
     pub fn new(log: LogId, lsn: LSN, vol_pages: PageCount, commit_pages: PageCount) -> Self {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&COMMIT_HASH_MAGIC);
-        hasher.update(log.as_bytes());
-        hasher.update(CBE64::from(lsn).as_bytes());
-        hasher.update(&vol_pages.to_u32().to_be_bytes());
-        hasher.update(&commit_pages.to_u32().to_be_bytes());
-        Self { hasher, last_pageidx: None }
+        let metadata = CommitMetadata::new(log, lsn, vol_pages, commit_pages);
+        Self {
+            metadata_bytes: metadata.bytes,
+            leaves: Vec::new(),
+            leaf_page_indices: Vec::new(),
+            last_pageidx: None,
+        }
     }
 
     /// Writes a page to the hash computation.
@@ -179,16 +221,283 @@ impl CommitHashBuilder {
             );
         }
 
-        self.hasher.update(&pageidx.to_u32().to_be_bytes());
-        self.hasher.update(page.as_ref());
+        let mut leaf_hasher = blake3::Hasher::new();
+        leaf_hasher.update(&pageidx.to_u32().to_be_bytes());
+        leaf_hasher.update(page.as_ref());
+        self.leaves.push(*leaf_hasher.finalize().as_bytes());
+        self.leaf_page_indices.push(pageidx);
+    }
+
+    /// Internal method that computes the Merkle tree and commit hash.
+    #[allow(clippy::type_complexity)]
+    fn build_inner(
+        self,
+    ) -> (
+        CommitHash,
+        MerkleTree<Blake3Algorithm>,
+        Vec<[u8; 32]>,
+        Vec<PageIdx>,
+        Vec<u8>,
+    ) {
+        let merkle_root: [u8; 32] = if self.leaves.is_empty() {
+            blake3::hash(b"EMPTY_MERKLE").into()
+        } else {
+            MerkleTree::<Blake3Algorithm>::from_leaves(&self.leaves)
+                .root()
+                .expect("non-empty tree must have root")
+        };
+
+        let tree = MerkleTree::<Blake3Algorithm>::from_leaves(&self.leaves);
+
+        let mut final_hasher = blake3::Hasher::new();
+        final_hasher.update(&self.metadata_bytes);
+        final_hasher.update(&merkle_root);
+        let hash = final_hasher.finalize();
+        let mut bytes = *hash.as_bytes();
+        bytes[0] = CommitHashPrefix::Value as u8;
+        let commit_hash: CommitHash =
+            zerocopy::try_transmute!(bytes).expect("prefix byte manually set");
+
+        (
+            commit_hash,
+            tree,
+            self.leaves,
+            self.leaf_page_indices,
+            self.metadata_bytes,
+        )
     }
 
     /// Finalizes the hash computation and returns the `CommitHash`.
     pub fn build(self) -> CommitHash {
-        let hash = self.hasher.finalize();
+        self.build_inner().0
+    }
+
+    /// Finalizes the hash computation and returns both the `CommitHash`
+    /// and a `CommitMerkleTree` for generating inclusion proofs.
+    pub fn build_with_tree(self) -> (CommitHash, CommitMerkleTree) {
+        let (hash, tree, leaves, indices, metadata_bytes) = self.build_inner();
+        (
+            hash,
+            CommitMerkleTree {
+                tree,
+                leaves,
+                leaf_page_indices: indices,
+                metadata_bytes,
+            },
+        )
+    }
+}
+
+/// A Merkle tree built from a commit's pages, used to generate inclusion proofs.
+pub struct CommitMerkleTree {
+    tree: MerkleTree<Blake3Algorithm>,
+    leaves: Vec<[u8; 32]>,
+    leaf_page_indices: Vec<PageIdx>,
+    metadata_bytes: Vec<u8>,
+}
+
+impl CommitMerkleTree {
+    /// Returns the Merkle root hash.
+    pub fn root(&self) -> Option<[u8; 32]> {
+        self.tree.root()
+    }
+
+    /// Returns the total number of leaves in the tree.
+    pub fn total_leaves(&self) -> usize {
+        self.leaves.len()
+    }
+
+    /// Returns the metadata bytes used to bind the Merkle root to the commit hash.
+    pub fn metadata_bytes(&self) -> &[u8] {
+        &self.metadata_bytes
+    }
+
+    /// Generates a Merkle inclusion proof for the given page indices.
+    ///
+    /// Returns an error if any of the requested page indices are not in the tree.
+    pub fn proof(&self, page_indices: &[PageIdx]) -> Result<MerkleInclusionProof, String> {
+        if self.leaves.is_empty() {
+            return Err("cannot generate proof for empty tree".to_string());
+        }
+
+        // Map PageIdx -> leaf position
+        let mut positions: Vec<usize> = Vec::with_capacity(page_indices.len());
+        for pidx in page_indices {
+            let pos = self
+                .leaf_page_indices
+                .iter()
+                .position(|p| p == pidx)
+                .ok_or_else(|| format!("page index {pidx} not found in tree"))?;
+            positions.push(pos);
+        }
+
+        // Sort and deduplicate (rs-merkle requires sorted indices)
+        positions.sort_unstable();
+        positions.dedup();
+
+        let proof = self.tree.proof(&positions);
+        let proof_bytes = proof.to_bytes();
+
+        Ok(MerkleInclusionProof {
+            proof_bytes,
+            leaf_positions: positions,
+            total_leaves: self.leaves.len(),
+        })
+    }
+}
+
+/// A serializable Merkle inclusion proof for one or more pages in a commit.
+#[derive(Clone, Debug)]
+pub struct MerkleInclusionProof {
+    proof_bytes: Vec<u8>,
+    leaf_positions: Vec<usize>,
+    total_leaves: usize,
+}
+
+impl MerkleInclusionProof {
+    /// Verifies that the given pages are included in the commit identified by `commit_hash`.
+    ///
+    /// Reconstructs leaf hashes from the provided page entries, uses the Merkle proof
+    /// to compute the root, then binds it to the metadata and checks against the commit hash.
+    pub fn verify(
+        &self,
+        commit_hash: &CommitHash,
+        metadata: &CommitMetadata,
+        page_entries: &[(PageIdx, &Page)],
+    ) -> bool {
+        // Reconstruct leaf hashes in the same order as leaf_positions
+        // First, build a map from PageIdx to leaf hash
+        let mut leaf_hashes_by_pos: Vec<(usize, [u8; 32])> = Vec::with_capacity(page_entries.len());
+
+        for (pageidx, page) in page_entries {
+            // We need to figure out which position this page corresponds to.
+            // The caller should provide pages in an order matching the proof's leaf_positions,
+            // but we match by computing all leaf hashes and pairing them.
+            let mut leaf_hasher = blake3::Hasher::new();
+            leaf_hasher.update(&pageidx.to_u32().to_be_bytes());
+            leaf_hasher.update(page.as_ref());
+            let leaf_hash = *leaf_hasher.finalize().as_bytes();
+
+            // Find the corresponding position in leaf_positions
+            // We need to try to find a position that hasn't been used yet
+            let mut found = false;
+            for &pos in &self.leaf_positions {
+                if !leaf_hashes_by_pos.iter().any(|(p, _)| *p == pos) {
+                    leaf_hashes_by_pos.push((pos, leaf_hash));
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return false;
+            }
+        }
+
+        if leaf_hashes_by_pos.len() != self.leaf_positions.len() {
+            return false;
+        }
+
+        // Sort by position to match the proof's expected order
+        leaf_hashes_by_pos.sort_by_key(|(pos, _)| *pos);
+
+        let leaf_hashes: Vec<[u8; 32]> = leaf_hashes_by_pos.into_iter().map(|(_, h)| h).collect();
+
+        // Deserialize the proof
+        let proof = match rs_merkle::MerkleProof::<Blake3Algorithm>::try_from(
+            self.proof_bytes.as_slice(),
+        ) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        // Compute the root from the proof
+        let computed_root = match proof.root(&self.leaf_positions, &leaf_hashes, self.total_leaves)
+        {
+            Ok(root) => root,
+            Err(_) => return false,
+        };
+
+        // Bind metadata to the computed root, same as build_inner
+        let mut final_hasher = blake3::Hasher::new();
+        final_hasher.update(metadata.as_bytes());
+        final_hasher.update(&computed_root);
+        let hash = final_hasher.finalize();
         let mut bytes = *hash.as_bytes();
         bytes[0] = CommitHashPrefix::Value as u8;
-        zerocopy::try_transmute!(bytes).expect("prefix byte manually set")
+
+        let reconstructed: CommitHash = match zerocopy::try_transmute!(bytes) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+
+        reconstructed == *commit_hash
+    }
+
+    /// Serializes the proof to bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        // total_leaves as u32
+        out.extend_from_slice(&(self.total_leaves as u32).to_be_bytes());
+
+        // number of leaf positions as u32
+        out.extend_from_slice(&(self.leaf_positions.len() as u32).to_be_bytes());
+
+        // each leaf position as u32
+        for &pos in &self.leaf_positions {
+            out.extend_from_slice(&(pos as u32).to_be_bytes());
+        }
+
+        // proof bytes length as u32
+        out.extend_from_slice(&(self.proof_bytes.len() as u32).to_be_bytes());
+
+        // proof bytes
+        out.extend_from_slice(&self.proof_bytes);
+
+        out
+    }
+
+    /// Deserializes a proof from bytes.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 8 {
+            return Err("proof data too short".to_string());
+        }
+
+        let mut offset = 0;
+
+        let total_leaves =
+            u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+
+        let num_positions =
+            u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+
+        if data.len() < offset + num_positions * 4 + 4 {
+            return Err("proof data too short for positions".to_string());
+        }
+
+        let mut leaf_positions = Vec::with_capacity(num_positions);
+        for _ in 0..num_positions {
+            let pos = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            leaf_positions.push(pos);
+        }
+
+        let proof_len = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+
+        if data.len() < offset + proof_len {
+            return Err("proof data too short for proof bytes".to_string());
+        }
+
+        let proof_bytes = data[offset..offset + proof_len].to_vec();
+
+        Ok(Self {
+            proof_bytes,
+            leaf_positions,
+            total_leaves,
+        })
     }
 }
 
@@ -236,7 +545,7 @@ mod tests {
                 lsn: lsn!(1),
                 page_count: PageCount::ZERO,
                 pages: vec![],
-                expected_hash: "5ZeW3W69UG1jwD4UXA62YJzCogeT5kZsjwfBfiQZCdKq",
+                expected_hash: "5XLfiYoRNuPT236PErRR4MDrx3SRnoCjtzg2tDwAoBf8",
             },
             TestCase {
                 name: "single_page",
@@ -244,7 +553,7 @@ mod tests {
                 lsn: lsn!(42),
                 page_count: PageCount::new(1),
                 pages: vec![(pageidx!(1), Page::test_filled(0xAA))],
-                expected_hash: "5X2JHhaMa9M1XFZ2vBCkd7UP9XtXfijvtSmBhUU4PPvi",
+                expected_hash: "5XZNaGb3NvnQbzY4pnqKT64aJq9XiY3whDWGjCj3KLNt",
             },
             TestCase {
                 name: "multiple_pages",
@@ -255,7 +564,7 @@ mod tests {
                     (pageidx!(1), Page::test_filled(0x11)),
                     (pageidx!(2), Page::test_filled(0x22)),
                 ],
-                expected_hash: "5YTaLg2LjV7GNc1Q2EZkuRuoKfyCD2qeL17wfVfvQXeU",
+                expected_hash: "5ZGDFuqfYg5tEdN8giQVf8m9eppf8yPmAgwhhf9WdFxF",
             },
         ];
 
@@ -340,5 +649,174 @@ mod tests {
                 )
             }
         }
+    }
+
+    #[test]
+    fn test_build_matches_build_with_tree() {
+        let log = LogId::random();
+        let lsn = lsn!(10);
+        let vol_pages = PageCount::new(3);
+        let commit_pages = PageCount::new(3);
+
+        let pages = vec![
+            (pageidx!(1), Page::test_filled(0x01)),
+            (pageidx!(2), Page::test_filled(0x02)),
+            (pageidx!(3), Page::test_filled(0x03)),
+        ];
+
+        // Build with build()
+        let mut builder1 = CommitHashBuilder::new(log.clone(), lsn, vol_pages, commit_pages);
+        for (idx, page) in &pages {
+            builder1.write_page(*idx, page);
+        }
+        let hash1 = builder1.build();
+
+        // Build with build_with_tree()
+        let mut builder2 = CommitHashBuilder::new(log, lsn, vol_pages, commit_pages);
+        for (idx, page) in &pages {
+            builder2.write_page(*idx, page);
+        }
+        let (hash2, _tree) = builder2.build_with_tree();
+
+        assert_eq!(
+            hash1, hash2,
+            "build() and build_with_tree() must produce the same hash"
+        );
+    }
+
+    #[test]
+    fn test_merkle_proof_single_page() {
+        let log = LogId::random();
+        let lsn = lsn!(1);
+        let vol_pages = PageCount::new(1);
+        let commit_pages = PageCount::new(1);
+        let page = Page::test_filled(0xAB);
+
+        let mut builder = CommitHashBuilder::new(log.clone(), lsn, vol_pages, commit_pages);
+        builder.write_page(pageidx!(1), &page);
+        let (hash, tree) = builder.build_with_tree();
+
+        let proof = tree
+            .proof(&[pageidx!(1)])
+            .expect("proof generation should succeed");
+
+        let metadata = CommitMetadata::new(log, lsn, vol_pages, commit_pages);
+        assert!(
+            proof.verify(&hash, &metadata, &[(pageidx!(1), &page)]),
+            "proof should verify for correct page"
+        );
+    }
+
+    #[test]
+    fn test_merkle_proof_multi_page() {
+        let log = LogId::random();
+        let lsn = lsn!(5);
+        let vol_pages = PageCount::new(4);
+        let commit_pages = PageCount::new(4);
+
+        let pages = vec![
+            (pageidx!(1), Page::test_filled(0x10)),
+            (pageidx!(2), Page::test_filled(0x20)),
+            (pageidx!(3), Page::test_filled(0x30)),
+            (pageidx!(4), Page::test_filled(0x40)),
+        ];
+
+        let mut builder = CommitHashBuilder::new(log.clone(), lsn, vol_pages, commit_pages);
+        for (idx, page) in &pages {
+            builder.write_page(*idx, page);
+        }
+        let (hash, tree) = builder.build_with_tree();
+
+        let metadata = CommitMetadata::new(log.clone(), lsn, vol_pages, commit_pages);
+
+        // Prove a subset (pages 2 and 4)
+        let proof = tree
+            .proof(&[pageidx!(2), pageidx!(4)])
+            .expect("proof generation should succeed");
+        assert!(
+            proof.verify(
+                &hash,
+                &metadata,
+                &[(pageidx!(2), &pages[1].1), (pageidx!(4), &pages[3].1)]
+            ),
+            "proof should verify for subset of pages"
+        );
+
+        // Prove all pages
+        let proof_all = tree
+            .proof(&[pageidx!(1), pageidx!(2), pageidx!(3), pageidx!(4)])
+            .expect("proof generation should succeed");
+        let all_entries: Vec<(PageIdx, &Page)> = pages.iter().map(|(i, p)| (*i, p)).collect();
+        assert!(
+            proof_all.verify(&hash, &metadata, &all_entries),
+            "proof should verify for all pages"
+        );
+    }
+
+    #[test]
+    fn test_merkle_proof_roundtrip() {
+        let log = LogId::random();
+        let lsn = lsn!(1);
+        let vol_pages = PageCount::new(2);
+        let commit_pages = PageCount::new(2);
+
+        let pages = vec![
+            (pageidx!(1), Page::test_filled(0xAA)),
+            (pageidx!(2), Page::test_filled(0xBB)),
+        ];
+
+        let mut builder = CommitHashBuilder::new(log.clone(), lsn, vol_pages, commit_pages);
+        for (idx, page) in &pages {
+            builder.write_page(*idx, page);
+        }
+        let (hash, tree) = builder.build_with_tree();
+
+        let proof = tree
+            .proof(&[pageidx!(1)])
+            .expect("proof generation should succeed");
+
+        // Serialize and deserialize
+        let serialized = proof.to_bytes();
+        let deserialized =
+            MerkleInclusionProof::from_bytes(&serialized).expect("deserialization should succeed");
+
+        let metadata = CommitMetadata::new(log, lsn, vol_pages, commit_pages);
+        assert!(
+            deserialized.verify(&hash, &metadata, &[(pageidx!(1), &pages[0].1)]),
+            "deserialized proof should still verify"
+        );
+    }
+
+    #[test]
+    fn test_merkle_proof_wrong_page_fails() {
+        let log = LogId::random();
+        let lsn = lsn!(1);
+        let vol_pages = PageCount::new(2);
+        let commit_pages = PageCount::new(2);
+
+        let pages = vec![
+            (pageidx!(1), Page::test_filled(0xAA)),
+            (pageidx!(2), Page::test_filled(0xBB)),
+        ];
+
+        let mut builder = CommitHashBuilder::new(log.clone(), lsn, vol_pages, commit_pages);
+        for (idx, page) in &pages {
+            builder.write_page(*idx, page);
+        }
+        let (hash, tree) = builder.build_with_tree();
+
+        // Generate proof for page 1
+        let proof = tree
+            .proof(&[pageidx!(1)])
+            .expect("proof generation should succeed");
+
+        let metadata = CommitMetadata::new(log, lsn, vol_pages, commit_pages);
+
+        // Try to verify with wrong page data
+        let wrong_page = Page::test_filled(0xCC);
+        assert!(
+            !proof.verify(&hash, &metadata, &[(pageidx!(1), &wrong_page)]),
+            "proof should NOT verify with wrong page data"
+        );
     }
 }
