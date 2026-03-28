@@ -180,6 +180,12 @@ pub struct Commit {
     /// Empty for legacy commits created before this feature was added.
     #[bilrost(8)]
     pub leaf_hashes: LeafHashIndex,
+
+    /// When true, all commits at this LSN or higher on this log must include
+    /// leaf hashes. Once set on any commit, it cannot be unset — the flag
+    /// propagates forward through the log.
+    #[bilrost(9)]
+    pub leaf_hashes_required: bool,
 }
 
 impl Commit {
@@ -193,6 +199,7 @@ impl Commit {
             segment_idx: None,
             checkpoints: Default::default(),
             leaf_hashes: Default::default(),
+            leaf_hashes_required: false,
         }
     }
 
@@ -224,6 +231,11 @@ impl Commit {
     /// Sets the leaf hash index for read-path integrity verification.
     pub fn with_leaf_hashes(self, leaf_hashes: LeafHashIndex) -> Self {
         Self { leaf_hashes, ..self }
+    }
+
+    /// Sets whether leaf hashes are required for this and all subsequent commits.
+    pub fn with_leaf_hashes_required(self, required: bool) -> Self {
+        Self { leaf_hashes_required: required, ..self }
     }
 
     pub fn log(&self) -> &LogId {

@@ -18,11 +18,12 @@ use crate::{
 
 pub struct AutosyncTask {
     ticker: Interval,
+    require_leaf_hashes: bool,
 }
 
 impl AutosyncTask {
-    pub fn new(ticker: Interval) -> Self {
-        Self { ticker }
+    pub fn new(ticker: Interval, require_leaf_hashes: bool) -> Self {
+        Self { ticker, require_leaf_hashes }
     }
 }
 
@@ -80,13 +81,19 @@ impl Task for AutosyncTask {
             }
 
             // execute all scheduled fetches
+            let require_leaf_hashes = self.require_leaf_hashes;
             let mut futures: FuturesUnordered<_> = fetches
                 .into_iter()
                 .map(|(log, leaf_hash_min_lsn)| {
+                    let effective_min = if require_leaf_hashes {
+                        Some(LSN::FIRST)
+                    } else {
+                        leaf_hash_min_lsn
+                    };
                     FetchLog {
                         log,
                         max_lsn: None,
-                        leaf_hash_min_lsn,
+                        leaf_hash_min_lsn: effective_min,
                     }
                     .run(storage.clone(), remote.clone())
                 })

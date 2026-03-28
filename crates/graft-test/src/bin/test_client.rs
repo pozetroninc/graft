@@ -175,6 +175,7 @@ fn main_inner() -> Result<(), TestErr> {
         remote,
         data_dir: data_dir.clone(),
         autosync: None,
+        require_leaf_hashes: false,
     })?;
 
     // initialize the main tag if needed

@@ -94,7 +94,8 @@ impl Action for RemoteCommit {
         .with_commit_hash(Some(commit_hash.clone()))
         .with_segment_idx(Some(segment_idx))
         .with_checkpoints(maybe_checkpoint)
-        .with_leaf_hashes(leaf_hashes);
+        .with_leaf_hashes(leaf_hashes)
+        .with_leaf_hashes_required(true);
 
         #[cfg(feature = "precept")]
         precept::sometimes_fault!(
@@ -126,6 +127,11 @@ impl Action for RemoteCommit {
                 storage
                     .read_write()
                     .remote_commit_success(&self.vid, commit)?;
+
+                // After successful push, set the trust boundary on this volume.
+                // Every push includes leaf hashes, so we know this LSN has them.
+                storage.read_write().set_leaf_hash_min_lsn(&self.vid, plan.commit_ref.lsn())?;
+
                 Ok(())
             }
             Err(err) if err.precondition_failed() => {

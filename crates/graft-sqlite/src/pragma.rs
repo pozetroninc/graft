@@ -311,6 +311,7 @@ impl GraftPragma {
                         segment_idx,
                         checkpoints,
                         leaf_hashes: _,
+                        leaf_hashes_required: _,
                     } = commit;
                     Ok(Some(formatdoc!(
                         "

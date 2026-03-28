@@ -35,6 +35,7 @@ struct RuntimeInner {
     tokio: tokio::runtime::Handle,
     storage: Arc<FjallStorage>,
     remote: Arc<Remote>,
+    require_leaf_hashes: bool,
 }
 
 impl Runtime {
@@ -44,6 +45,7 @@ impl Runtime {
         remote: Arc<Remote>,
         storage: Arc<FjallStorage>,
         autosync: Option<Duration>,
+        require_leaf_hashes: bool,
     ) -> Runtime {
         // spin up background tasks as needed
         if let Some(interval) = autosync {
@@ -53,11 +55,11 @@ impl Runtime {
             tokio_rt.spawn(supervise(
                 storage.clone(),
                 remote.clone(),
-                AutosyncTask::new(ticker),
+                AutosyncTask::new(ticker, require_leaf_hashes),
             ));
         }
         Runtime {
-            inner: Arc::new(RuntimeInner { tokio: tokio_rt, storage, remote }),
+            inner: Arc::new(RuntimeInner { tokio: tokio_rt, storage, remote, require_leaf_hashes }),
         }
     }
 
@@ -79,6 +81,14 @@ impl Runtime {
                 .expect("BUG: commit claims to contain pageidx");
 
             if let Some(page) = reader.read_page(idx.sid().clone(), pageidx)? {
+                if self.inner.require_leaf_hashes && commit.leaf_hashes.is_empty() {
+                    return Err(LogicalErr::MissingLeafHashes {
+                        log: commit.log.clone(),
+                        lsn: commit.lsn,
+                        min_lsn: LSN::FIRST,
+                    }
+                    .into());
+                }
                 if let Some(expected) = commit.leaf_hashes.get(pageidx) {
                     let actual = compute_leaf_hash(pageidx, &page);
                     if actual != expected {
@@ -257,10 +267,15 @@ impl Runtime {
         max_lsn: Option<LSN>,
         leaf_hash_min_lsn: Option<LSN>,
     ) -> Result<()> {
+        let effective_min = if self.inner.require_leaf_hashes {
+            Some(LSN::FIRST)
+        } else {
+            leaf_hash_min_lsn
+        };
         self.run_action(FetchLog {
             log,
             max_lsn,
-            leaf_hash_min_lsn,
+            leaf_hash_min_lsn: effective_min,
         })
     }
 
@@ -337,6 +352,7 @@ mod tests {
             remote.clone(),
             storage,
             Some(Duration::from_secs(1)),
+            false,
         );
 
         let remote_log = LogId::random();
@@ -378,6 +394,7 @@ mod tests {
             remote.clone(),
             storage,
             Some(Duration::from_secs(1)),
+            false,
         );
 
         // open the same remote log in the second runtime

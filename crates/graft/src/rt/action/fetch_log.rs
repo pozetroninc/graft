@@ -72,6 +72,12 @@ impl Action for FetchLog {
                 leaf_hash_min = Some(commit.lsn);
             }
 
+            // In-band enforcement: if any commit on this log has set
+            // leaf_hashes_required, establish the boundary permanently.
+            if commit.leaf_hashes_required && leaf_hash_min.is_none() {
+                leaf_hash_min = Some(commit.lsn);
+            }
+
             seen_lsns.insert(commit.lsn);
             // keep track of checkpoints that we need to re-fetch
             checkpoints.extend(
