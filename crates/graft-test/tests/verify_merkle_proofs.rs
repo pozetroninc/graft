@@ -393,3 +393,113 @@ fn test_vfs_read_detects_corrupted_cached_page() {
     runtime1.shutdown().unwrap();
     runtime2.shutdown().unwrap();
 }
+
+/// Writes pages via the Graft API, pushes, then replaces the segment in
+/// remote storage with a validly-compressed segment containing wrong page data
+/// (keeping the original commit with its leaf hashes). Node 2 pulls commits
+/// but when it reads a page, FetchSegment downloads the corrupt segment,
+/// decompresses it successfully (valid ZStd), but the leaf hash check rejects
+/// the page because the content doesn't match.
+#[test]
+fn test_fetch_detects_corrupted_remote_segment() {
+    use graft::remote::segment::SegmentBuilder;
+
+    graft_test::ensure_test_env();
+
+    let remote_log = LogId::random();
+    let runtime1 = GraftTestRuntime::with_memory_remote();
+
+    // Write 3 pages and push.
+    let vid1 = runtime1.volume_open(None, None, Some(remote_log.clone())).unwrap().vid;
+    let page1 = Page::test_filled(0x11);
+    let page2 = Page::test_filled(0x22);
+    let page3 = Page::test_filled(0x33);
+
+    let mut writer = runtime1.volume_writer(vid1.clone()).unwrap();
+    writer.write_page(pageidx!(1), page1.clone()).unwrap();
+    writer.write_page(pageidx!(2), page2.clone()).unwrap();
+    writer.write_page(pageidx!(3), page3.clone()).unwrap();
+    writer.commit().unwrap();
+    runtime1.volume_push(vid1.clone()).unwrap();
+
+    // Get the commit (which has leaf hashes for the ORIGINAL pages).
+    let vol1 = runtime1.volume_get(&vid1).unwrap();
+    let commit = runtime1
+        .get_commit(&vol1.remote, graft::lsn!(1))
+        .unwrap()
+        .expect("commit should exist");
+    let segment_idx = commit.segment_idx().expect("commit should have segment");
+    let sid = segment_idx.sid().clone();
+    assert!(!commit.leaf_hashes.is_empty(), "commit should have leaf hashes");
+    eprintln!(
+        "  pushed commit with {} leaf hashes, segment {sid}",
+        commit.leaf_hashes.len()
+    );
+
+    // Build a corrupt but validly-compressed segment with wrong page data.
+    let mut corrupt_builder = SegmentBuilder::new();
+    corrupt_builder.write(pageidx!(1), &Page::test_filled(0xAA)); // wrong
+    corrupt_builder.write(pageidx!(2), &Page::test_filled(0xBB)); // wrong
+    corrupt_builder.write(pageidx!(3), &Page::test_filled(0xCC)); // wrong
+    let (_frames, chunks) = corrupt_builder.finish();
+    let corrupt_bytes: bytes::Bytes = chunks.into_iter().flatten().collect();
+
+    // Replace the segment in remote. The commit still references the old
+    // leaf hashes but the segment now contains different page data.
+    let remote = runtime1.remote();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(remote.testonly_replace_segment(&sid, corrupt_bytes))
+        .unwrap();
+    eprintln!("  replaced segment in remote with corrupt data");
+
+    // Also rewrite the commit's frame index to match the new segment size.
+    // We need to update the commit so the byte ranges work for the new segment.
+    // The easiest way: build a new commit with the new frame index but OLD leaf hashes.
+    let new_commit = {
+        let mut c = commit.clone();
+        let mut new_idx = segment_idx.clone();
+        // Replace frames with the corrupt segment's frames
+        new_idx.frames = _frames;
+        c.segment_idx = Some(new_idx);
+        c
+    };
+    rt.block_on(async {
+        // Delete old commit and write new one
+        // Actually, for memory backend, put_commit with if_not_exists will fail.
+        // Instead, use the store directly to overwrite.
+        remote.testonly_replace_commit(&new_commit).await
+    })
+    .unwrap();
+    eprintln!("  updated commit frame index to match corrupt segment");
+
+    // Node 2: open the same remote log and pull (gets commit with old leaf hashes).
+    let runtime2 = runtime1.spawn_peer();
+    let vid2 = runtime2
+        .volume_open(None, None, Some(remote_log.clone()))
+        .unwrap()
+        .vid;
+    runtime2.volume_pull(vid2.clone()).unwrap();
+
+    // Read page 1 — should trigger FetchSegment which downloads the corrupt
+    // segment, decompresses it (valid ZStd), but leaf hash check fails.
+    let reader = runtime2.volume_reader(vid2.clone()).unwrap();
+    let result = reader.read_page(pageidx!(1));
+
+    assert!(
+        result.is_err(),
+        "read_page should fail due to leaf hash mismatch on corrupt remote segment"
+    );
+    let err = result.unwrap_err();
+    let err_str = format!("{err}");
+    eprintln!("  read correctly detected remote corruption: {err_str}");
+    assert!(
+        err_str.contains("integrity") || err_str.contains("Integrity"),
+        "error should mention integrity, got: {err_str}"
+    );
+
+    runtime1.shutdown().unwrap();
+    runtime2.shutdown().unwrap();
+}

@@ -106,6 +106,11 @@ impl GraftTestRuntime {
         conn
     }
 
+    /// Test-only: expose the remote storage for corruption tests.
+    pub fn remote(&self) -> &Remote {
+        &self.remote
+    }
+
     pub fn shutdown(self) -> std::thread::Result<()> {
         self.shutdown_tx.notify_one();
         self.thread.join()

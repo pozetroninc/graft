@@ -255,6 +255,26 @@ impl Remote {
         Ok(buffer.to_bytes())
     }
 
+    /// Test-only: replace a segment's raw bytes in remote storage.
+    #[cfg(feature = "testutil")]
+    pub async fn testonly_replace_segment(
+        &self,
+        sid: &SegmentId,
+        data: Bytes,
+    ) -> Result<()> {
+        let path = RemotePath::Segment(sid).build();
+        self.store.write(&path, data).await?;
+        Ok(())
+    }
+
+    /// Test-only: overwrite a commit in remote storage (bypassing if_not_exists).
+    #[cfg(feature = "testutil")]
+    pub async fn testonly_replace_commit(&self, commit: &Commit) -> Result<()> {
+        let path = RemotePath::Commit(&commit.log, commit.lsn).build();
+        self.store.write(&path, commit.encode_to_bytes()).await?;
+        Ok(())
+    }
+
     /// TESTONLY: list contents of this remote in a tree-like format
     #[cfg(test)]
     pub async fn testonly_format_tree(&self) -> String {
