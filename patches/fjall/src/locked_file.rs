@@ -7,6 +7,10 @@ use std::{fs::File, path::Path, sync::Arc};
 // On Android, `File::try_lock()` uses `flock()` which returns `ENOTSUP` on
 // Bionic libc. We use `fcntl(F_SETLK)` (POSIX record locks) instead, which
 // is universally supported on Android.
+//
+// Note: `fcntl(F_SETLK, F_WRLCK)` requires the file descriptor to be opened
+// with write access, unlike `flock(LOCK_EX)` which works on read-only fds.
+// We open lock files with read-write access on Android to support this.
 #[cfg(target_os = "android")]
 #[allow(unsafe_code)]
 mod platform_lock {
@@ -102,7 +106,13 @@ impl LockedFileGuard {
 
         let file = match File::create_new(path) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => File::open(path)?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // On Android, fcntl(F_WRLCK) requires write access to the fd.
+                #[cfg(target_os = "android")]
+                { File::options().read(true).write(true).open(path)? }
+                #[cfg(not(target_os = "android"))]
+                { File::open(path)? }
+            }
             e => e?,
         };
 
@@ -122,6 +132,10 @@ impl LockedFileGuard {
 
         log::debug!("Acquiring database lock at {}", path.display());
 
+        // On Android, fcntl(F_WRLCK) requires write access to the fd.
+        #[cfg(target_os = "android")]
+        let file = File::options().read(true).write(true).open(path)?;
+        #[cfg(not(target_os = "android"))]
         let file = File::open(path)?;
 
         for i in 1..=RETRIES {

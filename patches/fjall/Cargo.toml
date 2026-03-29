@@ -79,7 +79,7 @@ default-features = false
 version = "0.4.27"
 
 [dependencies.lsm-tree]
-version = "~3.0.1"
+version = "=3.0.1"
 features = []
 default-features = false
 

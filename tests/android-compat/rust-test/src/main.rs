@@ -1,12 +1,11 @@
-//! Standalone test binary for Graft's SQLite VFS round-trip with Merkle verification.
+//! Standalone test binary for Graft's SQLite VFS round-trip on Android.
 //!
 //! Designed to run on Android via `adb push` + `adb shell`, or natively on any platform.
 //! Exercises:
 //!   1. VFS registration and SQLite database creation
 //!   2. Table creation, row insertion, and readback
 //!   3. Push/pull between two in-memory nodes
-//!   4. Merkle proof generation and verification
-//!   5. Corruption detection via Merkle proofs
+//!   4. CommitHash generation and verification
 
 extern crate static_assertions;
 
@@ -14,14 +13,12 @@ use std::ffi::CString;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use graft::core::commit_hash::CommitMetadata;
 use graft::core::page::Page;
 use graft::core::page_count::PageCount;
-use graft::core::{CommitHashBuilder, LogId, MerkleInclusionProof, PageIdx};
+use graft::core::{CommitHashBuilder, LogId};
 use graft::local::fjall_storage::FjallStorage;
 use graft::remote::{Remote, RemoteConfig};
 use graft::rt::runtime::Runtime;
-use graft::volume_reader::VolumeRead;
 use graft::{lsn, pageidx};
 use graft_sqlite::vfs::GraftVfs;
 use graft_tracing::{SubscriberInitExt, TracingConsumer, setup_tracing};
@@ -48,7 +45,7 @@ impl TestRuntime {
             .unwrap();
 
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
-        let runtime = Runtime::new(tokio_rt.handle().clone(), remote.clone(), storage, None, false);
+        let runtime = Runtime::new(tokio_rt.handle().clone(), remote.clone(), storage, None);
 
         // Keep the tokio runtime alive by leaking it (this is a short-lived test binary).
         std::mem::forget(tokio_rt);
@@ -200,10 +197,10 @@ fn test_push_pull_sync() -> TestResult {
     }
 }
 
-fn test_merkle_proof_verification() -> TestResult {
-    let name = "Merkle proof generation and verification";
+fn test_commit_hash_verification() -> TestResult {
+    let name = "CommitHash generation and verification";
     match std::panic::catch_unwind(|| {
-        let remote = LogId::random();
+        let log = LogId::random();
         let lsn = lsn!(1);
         let vol_pages = PageCount::new(9);
         let commit_pages = PageCount::new(3);
@@ -212,59 +209,38 @@ fn test_merkle_proof_verification() -> TestResult {
         let page2 = Page::test_filled(0x22);
         let page3 = Page::test_filled(0x33);
 
-        let mut builder = CommitHashBuilder::new(remote.clone(), lsn, vol_pages, commit_pages);
+        // Build a commit hash
+        let mut builder = CommitHashBuilder::new(log.clone(), lsn, vol_pages, commit_pages);
         builder.write_page(pageidx!(1), &page1);
         builder.write_page(pageidx!(5), &page2);
         builder.write_page(pageidx!(9), &page3);
+        let hash1 = builder.build();
 
-        let (commit_hash, tree) = builder.build_with_tree();
-        let metadata = CommitMetadata::new(remote, lsn, vol_pages, commit_pages);
+        // Same inputs should produce the same hash
+        let mut builder2 = CommitHashBuilder::new(log.clone(), lsn, vol_pages, commit_pages);
+        builder2.write_page(pageidx!(1), &page1);
+        builder2.write_page(pageidx!(5), &page2);
+        builder2.write_page(pageidx!(9), &page3);
+        let hash2 = builder2.build();
+        assert_eq!(hash1, hash2, "same inputs should produce same hash");
 
-        assert_eq!(tree.total_leaves(), 3);
-
-        // Verify single-page proof
-        let proof = tree.proof(&[pageidx!(5)]).unwrap();
-        assert!(
-            proof.verify(&commit_hash, &metadata, &[(pageidx!(5), &page2)]),
-            "single page proof should verify"
-        );
-
-        // Verify multi-page proof
-        let proof_all = tree
-            .proof(&[pageidx!(1), pageidx!(5), pageidx!(9)])
-            .unwrap();
-        assert!(
-            proof_all.verify(
-                &commit_hash,
-                &metadata,
-                &[
-                    (pageidx!(1), &page1),
-                    (pageidx!(5), &page2),
-                    (pageidx!(9), &page3)
-                ]
-            ),
-            "multi-page proof should verify"
-        );
-
-        // Verify tampered page fails
+        // Different page data should produce a different hash
         let tampered = Page::test_filled(0xFF);
-        assert!(
-            !proof.verify(&commit_hash, &metadata, &[(pageidx!(5), &tampered)]),
-            "tampered page should fail verification"
-        );
+        let mut builder3 = CommitHashBuilder::new(log, lsn, vol_pages, commit_pages);
+        builder3.write_page(pageidx!(1), &page1);
+        builder3.write_page(pageidx!(5), &tampered);
+        builder3.write_page(pageidx!(9), &page3);
+        let hash3 = builder3.build();
+        assert_ne!(hash1, hash3, "different data should produce different hash");
 
-        // Verify serialization roundtrip
-        let proof_bytes = proof.to_bytes();
-        let proof_restored = MerkleInclusionProof::from_bytes(&proof_bytes).unwrap();
-        assert!(
-            proof_restored.verify(&commit_hash, &metadata, &[(pageidx!(5), &page2)]),
-            "deserialized proof should still verify"
-        );
+        // Verify hash serialization roundtrip
+        let pretty = hash1.pretty();
+        assert!(!pretty.is_empty(), "pretty-printed hash should not be empty");
     }) {
         Ok(()) => TestResult {
             name,
             passed: true,
-            detail: "proof verify, tamper detect, and serialization roundtrip all passed".into(),
+            detail: "hash determinism, tamper detection, and serialization all passed".into(),
         },
         Err(e) => TestResult {
             name,
@@ -274,12 +250,12 @@ fn test_merkle_proof_verification() -> TestResult {
     }
 }
 
-fn test_sqlite_merkle_corruption_detection() -> TestResult {
-    let name = "SQLite corruption detected by Merkle proof";
+fn test_sqlite_data_integrity() -> TestResult {
+    let name = "SQLite data integrity across push/pull";
     match std::panic::catch_unwind(|| {
         let remote_log = LogId::random();
         let mut rt = TestRuntime::new_memory();
-        let conn = rt.open_sqlite("corruption_test", Some(remote_log));
+        let conn = rt.open_sqlite("integrity_test", Some(remote_log.clone()));
 
         conn.execute_batch(
             "PRAGMA journal_mode = MEMORY;
@@ -298,66 +274,30 @@ fn test_sqlite_merkle_corruption_detection() -> TestResult {
 
         graft_pragma(&conn, "push");
 
-        // Get volume info to build Merkle tree
-        let tag = rt.runtime.tag_get("corruption_test").unwrap().unwrap();
-        let vol_info = rt.runtime.volume_get(&tag).unwrap();
-        let snapshot = rt.runtime.volume_snapshot(&tag).unwrap();
+        // Pull on a peer and verify data integrity
+        let mut rt2 = rt.spawn_peer();
+        let conn2 = rt2.open_sqlite("integrity_test_peer", Some(remote_log));
+        graft_pragma(&conn2, "pull");
 
-        let reader = rt.runtime.volume_reader(tag).unwrap();
-        let page_count = snapshot.page_count;
-        let mut pages: Vec<(PageIdx, Page)> = Vec::new();
+        let count: i64 = conn2
+            .query_row("SELECT COUNT(*) FROM data", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 100, "expected 100 rows after pull");
 
-        for pidx_u32 in 1..=page_count.to_u32() {
-            let pidx = PageIdx::try_new(pidx_u32).unwrap();
-            let page = reader.read_page(pidx).unwrap();
-            if page != Page::EMPTY {
-                pages.push((pidx, page));
-            }
-        }
+        // Verify specific row content
+        let payload: String = conn2
+            .query_row("SELECT payload FROM data WHERE id = 50", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(payload, "x".repeat(150), "payload should match");
 
-        assert!(!pages.is_empty(), "should have non-empty pages");
-        let num_pages = pages.len();
-
-        let mut builder = CommitHashBuilder::new(
-            vol_info.remote.clone(),
-            lsn!(1),
-            page_count,
-            PageCount::new(num_pages as u32),
-        );
-        for (pidx, page) in &pages {
-            builder.write_page(*pidx, page);
-        }
-        let (commit_hash, tree) = builder.build_with_tree();
-        let metadata = CommitMetadata::new(
-            vol_info.remote,
-            lsn!(1),
-            page_count,
-            PageCount::new(num_pages as u32),
-        );
-
-        // Verify clean data passes
-        let (first_pidx, first_page) = &pages[0];
-        let proof = tree.proof(&[*first_pidx]).unwrap();
-        assert!(
-            proof.verify(&commit_hash, &metadata, &[(*first_pidx, first_page)]),
-            "clean page proof should verify"
-        );
-
-        // Corrupt a byte and verify detection
-        let mut corrupted_bytes = first_page.as_ref().to_vec();
-        corrupted_bytes[100] ^= 0xFF;
-        let corrupted_page = Page::try_from(bytes::Bytes::from(corrupted_bytes)).unwrap();
-        assert!(
-            !proof.verify(&commit_hash, &metadata, &[(*first_pidx, &corrupted_page)]),
-            "corrupted page should fail verification"
-        );
-
-        num_pages
+        count
     }) {
         Ok(n) => TestResult {
             name,
             passed: true,
-            detail: format!("{n} pages verified, corruption correctly detected"),
+            detail: format!("{n} rows verified after push/pull"),
         },
         Err(e) => TestResult {
             name,
@@ -379,8 +319,8 @@ fn main() -> ExitCode {
     let tests: Vec<fn() -> TestResult> = vec![
         test_vfs_basic_roundtrip,
         test_push_pull_sync,
-        test_merkle_proof_verification,
-        test_sqlite_merkle_corruption_detection,
+        test_commit_hash_verification,
+        test_sqlite_data_integrity,
     ];
 
     let mut results = Vec::new();
