@@ -1,6 +1,8 @@
 [files]
 extend-exclude = [
- "context7.json"
+ "context7.json",
+ # Vendored upstream crate — don't spellcheck code we don't own
+ "patches/fjall/**",
 ]
 
 [default]
