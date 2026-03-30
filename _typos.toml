@@ -10,3 +10,7 @@ extend-ignore-re = [
   # ignore gids
   "[1-9A-HJ-NP-Za-km-z]{10}-[1-9A-HJ-NP-Za-km-z]{13}"
 ]
+
+[default.extend-words]
+# Apple's Unique Device Identifier (used in iOS tooling)
+udid = "udid"
