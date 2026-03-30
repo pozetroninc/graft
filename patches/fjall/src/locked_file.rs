@@ -11,6 +11,11 @@ use std::{fs::File, path::Path, sync::Arc};
 // Note: `fcntl(F_SETLK, F_WRLCK)` requires the file descriptor to be opened
 // with write access, unlike `flock(LOCK_EX)` which works on read-only fds.
 // We open lock files with read-write access on Android to support this.
+//
+// Semantic difference: POSIX record locks (fcntl) are per-process, not per-fd.
+// A second open of the same lock file within the same process will succeed even
+// when a lock is held. flock() is per open-file-description. This is fine for
+// fjall's single-keyspace-per-process model.
 #[cfg(target_os = "android")]
 #[allow(unsafe_code)]
 mod platform_lock {
