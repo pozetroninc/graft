@@ -1,0 +1,21 @@
+# Build artifacts
+rust-test/target/
+jni-bridge/target/
+rust-test/Cargo.lock
+jni-bridge/Cargo.lock
+
+# Stripped test binary (built by build.sh)
+graft-android-test
+
+# Native libraries (built by build.sh, large binaries)
+app/src/main/jniLibs/
+
+# Gradle build artifacts
+.gradle/
+app/build/
+build/
+local.properties
+
+# IDE
+.idea/
+*.iml

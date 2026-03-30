@@ -1,0 +1,46 @@
+name: GraftTest
+options:
+  bundleIdPrefix: dev.orbitinghail.graft
+  deploymentTarget:
+    iOS: "16.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+
+targets:
+  GraftTest:
+    type: application
+    platform: iOS
+    sources:
+      - path: GraftTest
+        type: group
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.orbitinghail.graft.test
+        GENERATE_INFOPLIST_FILE: "YES"
+        SWIFT_OBJC_BRIDGING_HEADER: GraftTest/BridgingHeader.h
+        SUPPORTED_PLATFORMS: "iphonesimulator iphoneos"
+        SUPPORTS_MACCATALYST: "NO"
+        SDKROOT: iphoneos
+        LIBRARY_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(PROJECT_DIR)/../../target/aarch64-apple-ios-sim/release"
+        OTHER_LDFLAGS:
+          - "-lgraft_ext"
+          - "-lz"
+          - "-lc++"
+          - "-framework Security"
+          - "-framework SystemConfiguration"
+          - "-lsqlite3"
+          - "-lresolv"
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+        CODE_SIGNING_ALLOWED: "NO"
+
+schemes:
+  GraftTest:
+    build:
+      targets:
+        GraftTest: all
+    run:
+      config: Release

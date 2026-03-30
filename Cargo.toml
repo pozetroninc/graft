@@ -64,6 +64,11 @@ features = ["services-s3", "services-fs"]
 git = "https://github.com/apache/opendal"
 branch = "main"
 
+[patch.crates-io]
+# Patch fjall to use fcntl-based file locking on Android, where flock() is
+# unsupported by Bionic libc (returns ENOTSUP).
+fjall = { path = "patches/fjall" }
+
 [workspace.lints.clippy]
 disallowed_methods = "deny"
 uninlined_format_args = "warn"
