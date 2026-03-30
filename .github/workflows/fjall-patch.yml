@@ -1,0 +1,162 @@
+name: Evergreen fjall patch
+
+# Keeps the vendored fjall Android locking patch in sync with upstream.
+# Runs weekly + on any change to Cargo.toml or Cargo.lock, and can be
+# triggered manually.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Every Monday at 9:00 AM UTC
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-fjall-patch:
+    name: Check fjall patch is current
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Detect fjall versions
+        id: versions
+        run: |
+          # Version in the vendored patch
+          PATCH_VERSION=$(grep '^version' patches/fjall/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "patch_version=$PATCH_VERSION" >> "$GITHUB_OUTPUT"
+
+          # Version resolved by cargo (from the lock file)
+          LOCK_VERSION=$(grep -A1 '^name = "fjall"' Cargo.lock | grep '^version' | sed 's/.*"\(.*\)"/\1/')
+          echo "lock_version=$LOCK_VERSION" >> "$GITHUB_OUTPUT"
+
+          echo "Patch version: $PATCH_VERSION"
+          echo "Lock version:  $LOCK_VERSION"
+
+          if [ "$PATCH_VERSION" != "$LOCK_VERSION" ]; then
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::fjall patch ($PATCH_VERSION) is out of sync with Cargo.lock ($LOCK_VERSION)"
+          else
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "Patch is in sync with Cargo.lock"
+          fi
+
+      - name: Update vendored fjall patch
+        if: steps.versions.outputs.needs_update == 'true'
+        env:
+          NEW_VERSION: ${{ steps.versions.outputs.lock_version }}
+        run: |
+          set -euo pipefail
+
+          echo "==> Fetching fjall $NEW_VERSION from crates.io registry..."
+          # Force cargo to download the new version
+          cargo fetch
+
+          # Find the downloaded source
+          REGISTRY_SRC=$(find "$HOME/.cargo/registry/src" -maxdepth 1 -name "index.crates.io-*" -type d | head -1)
+          NEW_SRC="$REGISTRY_SRC/fjall-$NEW_VERSION"
+
+          if [ ! -d "$NEW_SRC" ]; then
+            echo "::error::Could not find fjall $NEW_VERSION in cargo registry at $NEW_SRC"
+            exit 1
+          fi
+
+          echo "==> Saving patched locked_file.rs..."
+          cp patches/fjall/src/locked_file.rs /tmp/locked_file.rs.patched
+          cp patches/fjall/PATCH_README.md /tmp/PATCH_README.md 2>/dev/null || true
+
+          echo "==> Replacing vendored fjall with $NEW_VERSION..."
+          rm -rf patches/fjall
+          cp -r "$NEW_SRC" patches/fjall
+
+          echo "==> Re-applying locked_file.rs patch..."
+          cp /tmp/locked_file.rs.patched patches/fjall/src/locked_file.rs
+          cp /tmp/PATCH_README.md patches/fjall/PATCH_README.md 2>/dev/null || true
+
+          echo "==> Adding libc dependency for Android..."
+          if ! grep -q 'target_os = "android"' patches/fjall/Cargo.toml; then
+            cat >> patches/fjall/Cargo.toml << 'EOF'
+
+          [target.'cfg(target_os = "android")'.dependencies.libc]
+          version = "0.2"
+          EOF
+          fi
+
+          echo "==> Pinning lsm-tree version..."
+          # Find the lsm-tree version from the new fjall's deps
+          LSM_VERSION=$(grep -A2 '\[dependencies.lsm-tree\]' patches/fjall/Cargo.toml | grep 'version' | sed 's/.*"\(.*\)"/\1/')
+          # Pin it exactly to prevent minor version drift in standalone workspaces
+          sed -i "s|version = \"${LSM_VERSION}\"|version = \"=${LSM_VERSION#\~}\"|" patches/fjall/Cargo.toml
+
+          echo "==> Updated patches/fjall to version $NEW_VERSION"
+
+      - name: Verify patch compiles (host)
+        if: steps.versions.outputs.needs_update == 'true'
+        run: cargo check -p fjall
+
+      - name: Verify patch compiles (Android targets)
+        if: steps.versions.outputs.needs_update == 'true'
+        run: |
+          cargo check -p fjall --target aarch64-linux-android
+          cargo check -p fjall --target x86_64-linux-android
+
+      - name: Verify graft tests pass
+        if: steps.versions.outputs.needs_update == 'true'
+        run: |
+          sudo apt-get install -y clang libclang-dev llvm 2>/dev/null || true
+          cargo test -p graft
+
+      - name: Create pull request
+        if: steps.versions.outputs.needs_update == 'true'
+        uses: peter-evans/create-pull-request@271a8d0340265f705b14b6d32b9829c1cb33d45e # v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: chore/update-fjall-patch
+          delete-branch: true
+          title: "chore: update vendored fjall patch to ${{ steps.versions.outputs.lock_version }}"
+          body: |
+            ## Summary
+
+            The vendored fjall patch (`patches/fjall/`) was at version
+            **${{ steps.versions.outputs.patch_version }}** but `Cargo.lock`
+            resolved to **${{ steps.versions.outputs.lock_version }}**.
+
+            This PR updates the vendored copy to the new version and re-applies
+            the Android `fcntl`-based locking patch to `locked_file.rs`.
+
+            ## Automated checks
+
+            - [x] `cargo check -p fjall` (host)
+            - [x] `cargo check -p fjall --target aarch64-linux-android`
+            - [x] `cargo check -p fjall --target x86_64-linux-android`
+            - [x] `cargo test -p graft`
+
+            > **Manual step**: Run the Android emulator tests to verify the
+            > patch still works end-to-end before merging.
+          commit-message: "chore: update vendored fjall patch to ${{ steps.versions.outputs.lock_version }}"
+          labels: dependencies
+
+      - name: Verify patch is in sync (CI gate)
+        if: steps.versions.outputs.needs_update == 'true' && github.event_name == 'push'
+        run: |
+          echo "::warning::fjall patch is out of date — an update PR has been created."
+          echo "The vendored patch at patches/fjall/ (${{ steps.versions.outputs.patch_version }}) does not match Cargo.lock (${{ steps.versions.outputs.lock_version }})."
+          echo "Please merge the auto-generated PR to update it."
