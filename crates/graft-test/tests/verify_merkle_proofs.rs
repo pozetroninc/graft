@@ -1,8 +1,6 @@
 use graft::{
     core::{
-        CommitHashBuilder, MerkleInclusionProof, LogId,
-        commit_hash::CommitMetadata,
-        page::Page,
+        CommitHashBuilder, LogId, MerkleInclusionProof, commit_hash::CommitMetadata, page::Page,
         page_count::PageCount,
     },
     lsn, pageidx,
@@ -54,12 +52,7 @@ fn test_merkle_proof_after_push_pull() -> anyhow::Result<()> {
     let vol_pages = PageCount::new(9);
     let commit_pages = PageCount::new(3);
 
-    let mut builder = CommitHashBuilder::new(
-        vol_info.remote.clone(),
-        lsn,
-        vol_pages,
-        commit_pages,
-    );
+    let mut builder = CommitHashBuilder::new(vol_info.remote.clone(), lsn, vol_pages, commit_pages);
     builder.write_page(pageidx!(1), &page1);
     builder.write_page(pageidx!(5), &page2);
     builder.write_page(pageidx!(9), &page3);
@@ -125,12 +118,7 @@ fn test_merkle_proof_sparse_pages() -> anyhow::Result<()> {
     let page_b = Page::test_filled(0xBB);
     let page_c = Page::test_filled(0xCC);
 
-    let mut builder = CommitHashBuilder::new(
-        remote.clone(),
-        lsn,
-        vol_pages,
-        commit_pages,
-    );
+    let mut builder = CommitHashBuilder::new(remote.clone(), lsn, vol_pages, commit_pages);
     builder.write_page(pageidx!(1), &page_a);
     builder.write_page(pageidx!(100), &page_b);
     builder.write_page(pageidx!(1000), &page_c);
@@ -158,12 +146,7 @@ fn test_merkle_proof_single_page_commit() -> anyhow::Result<()> {
     let commit_pages = PageCount::new(1);
     let page = Page::test_filled(0x42);
 
-    let mut builder = CommitHashBuilder::new(
-        remote.clone(),
-        lsn,
-        vol_pages,
-        commit_pages,
-    );
+    let mut builder = CommitHashBuilder::new(remote.clone(), lsn, vol_pages, commit_pages);
     builder.write_page(pageidx!(1), &page);
 
     let (hash, tree) = builder.build_with_tree();
@@ -358,7 +341,9 @@ fn test_vfs_read_detects_corrupted_cached_page() {
     let pidx2 = graft::core::PageIdx::try_new(2).unwrap();
     // Debug: check if the commit has leaf hashes
     let volume2 = runtime2.volume_get(&tag2).unwrap();
-    let commit = runtime2.get_commit(&volume2.remote, graft::lsn!(1)).unwrap();
+    let commit = runtime2
+        .get_commit(&volume2.remote, graft::lsn!(1))
+        .unwrap();
     match &commit {
         Some(c) => {
             eprintln!(
@@ -410,7 +395,10 @@ fn test_fetch_detects_corrupted_remote_segment() {
     let runtime1 = GraftTestRuntime::with_memory_remote();
 
     // Write 3 pages and push.
-    let vid1 = runtime1.volume_open(None, None, Some(remote_log.clone())).unwrap().vid;
+    let vid1 = runtime1
+        .volume_open(None, None, Some(remote_log.clone()))
+        .unwrap()
+        .vid;
     let page1 = Page::test_filled(0x11);
     let page2 = Page::test_filled(0x22);
     let page3 = Page::test_filled(0x33);
@@ -430,7 +418,10 @@ fn test_fetch_detects_corrupted_remote_segment() {
         .expect("commit should exist");
     let segment_idx = commit.segment_idx().expect("commit should have segment");
     let sid = segment_idx.sid().clone();
-    assert!(!commit.leaf_hashes.is_empty(), "commit should have leaf hashes");
+    assert!(
+        !commit.leaf_hashes.is_empty(),
+        "commit should have leaf hashes"
+    );
     eprintln!(
         "  pushed commit with {} leaf hashes, segment {sid}",
         commit.leaf_hashes.len()

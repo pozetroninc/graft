@@ -40,9 +40,7 @@ impl LeafHashIndex {
             buf.extend_from_slice(&pageidx.to_u32().to_be_bytes());
             buf.extend_from_slice(hash);
         }
-        Self {
-            data: Bytes::from(buf),
-        }
+        Self { data: Bytes::from(buf) }
     }
 
     /// Looks up the leaf hash for the given page index using binary search.
@@ -88,8 +86,7 @@ impl LeafHashIndex {
     pub fn iter(&self) -> impl Iterator<Item = (PageIdx, [u8; 32])> + '_ {
         (0..self.len()).map(move |i| {
             let offset = i * LEAF_HASH_ENTRY_SIZE;
-            let pageidx_raw =
-                u32::from_be_bytes(self.data[offset..offset + 4].try_into().unwrap());
+            let pageidx_raw = u32::from_be_bytes(self.data[offset..offset + 4].try_into().unwrap());
             let pageidx = PageIdx::try_new(pageidx_raw).expect("valid PageIdx in LeafHashIndex");
             let mut hash = [0u8; 32];
             hash.copy_from_slice(&self.data[offset + 4..offset + LEAF_HASH_ENTRY_SIZE]);

@@ -1,8 +1,13 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::core::{
-    LogId, PageCount, PageIdx, VolumeId, checksum::Checksum, commit::Commit,
-    commit_hash::{CommitHashBuilder, compute_leaf_hash}, logref::LogRef, lsn::LSN, page::Page,
+    LogId, PageCount, PageIdx, VolumeId,
+    checksum::Checksum,
+    commit::Commit,
+    commit_hash::{CommitHashBuilder, compute_leaf_hash},
+    logref::LogRef,
+    lsn::LSN,
+    page::Page,
     pageset::PageSet,
 };
 use bytestring::ByteString;
@@ -60,7 +65,12 @@ impl Runtime {
             ));
         }
         Runtime {
-            inner: Arc::new(RuntimeInner { tokio: tokio_rt, storage, remote, require_leaf_hashes }),
+            inner: Arc::new(RuntimeInner {
+                tokio: tokio_rt,
+                storage,
+                remote,
+                require_leaf_hashes,
+            }),
         }
     }
 
@@ -91,11 +101,9 @@ impl Runtime {
                     .into());
                 }
                 if !commit.leaf_hashes.is_empty() {
-                    let expected =
-                        commit.leaf_hashes.get(pageidx).ok_or_else(|| LogicalErr::MissingLeafHash {
-                            sid: idx.sid().clone(),
-                            pageidx,
-                        })?;
+                    let expected = commit.leaf_hashes.get(pageidx).ok_or_else(|| {
+                        LogicalErr::MissingLeafHash { sid: idx.sid().clone(), pageidx }
+                    })?;
                     let actual = compute_leaf_hash(pageidx, &page);
                     if actual != expected {
                         return Err(LogicalErr::PageIntegrity {
@@ -326,9 +334,7 @@ impl Runtime {
     }
 
     pub fn snapshot_hydrate(&self, snapshot: Snapshot) -> Result<()> {
-        self.run_action(HydrateSnapshot {
-            snapshot: snapshot.clone(),
-        })?;
+        self.run_action(HydrateSnapshot { snapshot: snapshot.clone() })?;
 
         // After hydration, verify commit hashes for all commits in the snapshot.
         // This catches any tampering with the integrity chain by a compromised remote.
@@ -376,11 +382,9 @@ impl Runtime {
             for pidx in segment_idx.pageset().iter() {
                 let page = reader
                     .read_page(segment_idx.sid().clone(), pidx)?
-                    .ok_or_else(|| {
-                        LogicalErr::PageNotFound {
-                            sid: segment_idx.sid().clone(),
-                            pageidx: pidx,
-                        }
+                    .ok_or_else(|| LogicalErr::PageNotFound {
+                        sid: segment_idx.sid().clone(),
+                        pageidx: pidx,
                     })?;
                 builder.write_page(pidx, &page);
             }

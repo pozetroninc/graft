@@ -372,8 +372,7 @@ impl CommitMerkleTree {
         paired.sort_unstable_by_key(|(pos, _)| *pos);
         paired.dedup_by_key(|(pos, _)| *pos);
 
-        let (positions, leaf_page_indices): (Vec<usize>, Vec<PageIdx>) =
-            paired.into_iter().unzip();
+        let (positions, leaf_page_indices): (Vec<usize>, Vec<PageIdx>) = paired.into_iter().unzip();
 
         let proof = self.tree.proof(&positions);
         let proof_bytes = proof.to_bytes();

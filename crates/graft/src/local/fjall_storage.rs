@@ -463,10 +463,7 @@ impl<'a> ReadGuard<'a> {
 
     /// Find the first (lowest) LSN on a log that has non-empty leaf hashes.
     /// Used to establish the trust-on-first-use boundary.
-    pub fn first_lsn_with_leaf_hashes(
-        &self,
-        log: &LogId,
-    ) -> Result<Option<LSN>, FjallStorageErr> {
+    pub fn first_lsn_with_leaf_hashes(&self, log: &LogId) -> Result<Option<LSN>, FjallStorageErr> {
         let low = LogRef::new(log.clone(), LSN::FIRST);
         let high = LogRef::new(log.clone(), LSN::LAST);
         // Log stores LSNs in reverse, so high..=low scans from newest to oldest.

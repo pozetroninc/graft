@@ -257,11 +257,7 @@ impl Remote {
 
     /// Test-only: replace a segment's raw bytes in remote storage.
     #[cfg(feature = "testutil")]
-    pub async fn testonly_replace_segment(
-        &self,
-        sid: &SegmentId,
-        data: Bytes,
-    ) -> Result<()> {
+    pub async fn testonly_replace_segment(&self, sid: &SegmentId, data: Bytes) -> Result<()> {
         let path = RemotePath::Segment(sid).build();
         self.store.write(&path, data).await?;
         Ok(())
