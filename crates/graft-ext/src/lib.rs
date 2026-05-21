@@ -43,6 +43,10 @@ pub struct ExtensionConfig {
     /// if set, specifies the autosync interval in seconds
     #[serde(default = "Option::default")]
     autosync: Option<NonZero<u64>>,
+
+    /// if true, all commits must include leaf hashes
+    #[serde(default)]
+    require_leaf_hashes: bool,
 }
 
 impl ExtensionConfig {
@@ -51,6 +55,7 @@ impl ExtensionConfig {
             remote: self.remote.clone(),
             data_dir: self.data_dir.clone(),
             autosync: self.autosync,
+            require_leaf_hashes: self.require_leaf_hashes,
         }
     }
 }

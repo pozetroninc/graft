@@ -31,6 +31,7 @@ parking_lot = { workspace = true }
 precept = { workspace = true, optional = true }
 rand = { workspace = true }
 range-set-blaze = { workspace = true }
+rs_merkle = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 splinter-rs = { workspace = true }
@@ -48,6 +49,7 @@ zerocopy = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+toml = { workspace = true }
 assert_matches = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }

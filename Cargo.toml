@@ -39,6 +39,8 @@ precept = "0.3.0"
 rand = "0.10.0"
 range-set-blaze = "0.4.1"
 reqwest = { version = "0.12.26", default-features = false, features = ["hickory-dns"] }
+rs_merkle = "1.4"
+toml = "0.8"
 rusqlite = "0.38.0"
 serde = "1.0.228"
 splinter-rs = "0.12.1"

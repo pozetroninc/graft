@@ -310,6 +310,8 @@ impl GraftPragma {
                         commit_hash,
                         segment_idx,
                         checkpoints,
+                        leaf_hashes: _,
+                        leaf_hashes_required: _,
                     } = commit;
                     Ok(Some(formatdoc!(
                         "
@@ -429,6 +431,9 @@ fn format_volume_audit(runtime: &Runtime, file: &VolFile) -> Result<String, ErrC
     let missing_pages = runtime.snapshot_missing_pages(&snapshot)?;
     let pages = file.page_count()?.to_usize();
     if missing_pages.is_empty() {
+        // Volume is fully hydrated — verify commit hashes
+        runtime.verify_snapshot_commit_hashes(&snapshot)?;
+
         let checksum = runtime.snapshot_checksum(&snapshot)?;
         Ok(formatdoc!(
             "
@@ -456,7 +461,8 @@ fn fetch_or_pull(runtime: &Runtime, file: &mut VolFile, pull: bool) -> Result<St
     if pull {
         runtime.volume_pull(file.vid.clone())?;
     } else {
-        runtime.fetch_log(pre.remote, None)?;
+        let volume = runtime.volume_get(&file.vid)?;
+        runtime.fetch_log(pre.remote, None, volume.leaf_hash_min_lsn)?;
     }
     let post = runtime.volume_status(&file.vid)?;
 

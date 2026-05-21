@@ -67,6 +67,11 @@ pub struct Volume {
     /// abort the commit process.
     #[bilrost(5)]
     pub pending_commit: Option<PendingCommit>,
+
+    /// The first LSN on the remote log where leaf hashes were present.
+    /// Once set, all commits at this LSN or higher must have leaf hashes.
+    #[bilrost(6)]
+    pub leaf_hash_min_lsn: Option<LSN>,
 }
 
 impl Volume {
@@ -77,7 +82,14 @@ impl Volume {
         sync: Option<SyncPoint>,
         pending_commit: Option<PendingCommit>,
     ) -> Self {
-        Self { vid, local, remote, sync, pending_commit }
+        Self {
+            vid,
+            local,
+            remote,
+            sync,
+            pending_commit,
+            leaf_hash_min_lsn: None,
+        }
     }
 
     pub fn new_random() -> Self {
@@ -87,6 +99,7 @@ impl Volume {
             remote: LogId::random(),
             sync: None,
             pending_commit: None,
+            leaf_hash_min_lsn: None,
         }
     }
 

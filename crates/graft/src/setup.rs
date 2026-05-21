@@ -20,6 +20,10 @@ pub struct GraftConfig {
     /// if set, specifies the autosync interval in seconds
     #[serde(default)]
     pub autosync: Option<NonZero<u64>>,
+
+    /// if true, all commits must include leaf hashes — the TOFU grace period is eliminated
+    #[serde(default)]
+    pub require_leaf_hashes: bool,
 }
 
 #[derive(Debug, Error)]
@@ -55,5 +59,11 @@ pub fn setup_graft(config: GraftConfig) -> Result<Runtime, InitErr> {
     let remote = Arc::new(config.remote.build()?);
     let storage = Arc::new(FjallStorage::open(config.data_dir)?);
     let autosync = config.autosync.map(|s| Duration::from_secs(s.get()));
-    Ok(Runtime::new(tokio_handle, remote, storage, autosync))
+    Ok(Runtime::new(
+        tokio_handle,
+        remote,
+        storage,
+        autosync,
+        config.require_leaf_hashes,
+    ))
 }

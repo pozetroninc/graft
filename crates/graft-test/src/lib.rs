@@ -73,7 +73,13 @@ impl GraftTestRuntime {
             .unwrap();
 
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
-        let runtime = Runtime::new(tokio_rt.handle().clone(), remote.clone(), storage, None);
+        let runtime = Runtime::new(
+            tokio_rt.handle().clone(),
+            remote.clone(),
+            storage,
+            None,
+            false,
+        );
 
         let shutdown_tx = Arc::new(Notify::const_new());
         let shutdown_rx = shutdown_tx.clone();
@@ -104,6 +110,11 @@ impl GraftTestRuntime {
             conn.graft_pragma_arg("clone", remote.serialize()).unwrap();
         }
         conn
+    }
+
+    /// Test-only: expose the remote storage for corruption tests.
+    pub fn remote(&self) -> &Remote {
+        &self.remote
     }
 
     pub fn shutdown(self) -> std::thread::Result<()> {

@@ -1,6 +1,7 @@
 use std::ops::{Deref, DerefMut, Range, RangeInclusive};
 
 use bilrost::Message;
+use bytes::Bytes;
 use itertools::Itertools;
 use splinter_rs::Splinter;
 use thin_vec::ThinVec;
@@ -9,6 +10,132 @@ use crate::core::{
     LogId, PageCount, PageIdx, SegmentId, commit_hash::CommitHash, logref::LogRef, lsn::LSN,
     pageset::PageSet,
 };
+use crate::derive_newtype_proxy;
+
+/// Entry size in the `LeafHashIndex`: 4 bytes for PageIdx (big-endian) + 32 bytes for hash.
+const LEAF_HASH_ENTRY_SIZE: usize = 4 + 32;
+
+/// A compact sorted index of per-page leaf hashes.
+///
+/// Stored as a flat byte buffer where each entry is 36 bytes:
+/// 4 bytes (PageIdx in big-endian) + 32 bytes (BLAKE3 leaf hash).
+/// Entries are sorted by PageIdx, enabling O(log n) lookup via binary search.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LeafHashIndex {
+    /// Flat byte buffer: each entry is 4 bytes (pageidx BE) + 32 bytes (hash).
+    data: Bytes,
+}
+
+impl LeafHashIndex {
+    /// Builds a `LeafHashIndex` from a slice of (PageIdx, hash) pairs.
+    ///
+    /// The input entries must already be sorted by PageIdx (this is guaranteed
+    /// when coming from `CommitHashBuilder` which enforces page ordering).
+    pub fn new(entries: &[(PageIdx, [u8; 32])]) -> Self {
+        if entries.is_empty() {
+            return Self::default();
+        }
+        let mut buf = Vec::with_capacity(entries.len() * LEAF_HASH_ENTRY_SIZE);
+        for (pageidx, hash) in entries {
+            buf.extend_from_slice(&pageidx.to_u32().to_be_bytes());
+            buf.extend_from_slice(hash);
+        }
+        Self { data: Bytes::from(buf) }
+    }
+
+    /// Looks up the leaf hash for the given page index using binary search.
+    /// Returns `None` if the page index is not in the index.
+    pub fn get(&self, pageidx: PageIdx) -> Option<[u8; 32]> {
+        let n = self.len();
+        if n == 0 {
+            return None;
+        }
+        let target = pageidx.to_u32();
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let offset = mid * LEAF_HASH_ENTRY_SIZE;
+            let entry_pageidx =
+                u32::from_be_bytes(self.data[offset..offset + 4].try_into().unwrap());
+            match entry_pageidx.cmp(&target) {
+                std::cmp::Ordering::Equal => {
+                    let hash_start = offset + 4;
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&self.data[hash_start..hash_start + 32]);
+                    return Some(hash);
+                }
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        None
+    }
+
+    /// Returns `true` if the index contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Returns the number of entries in the index.
+    pub fn len(&self) -> usize {
+        self.data.len() / LEAF_HASH_ENTRY_SIZE
+    }
+
+    /// Iterates over all (PageIdx, hash) entries in sorted order.
+    pub fn iter(&self) -> impl Iterator<Item = (PageIdx, [u8; 32])> + '_ {
+        (0..self.len()).map(move |i| {
+            let offset = i * LEAF_HASH_ENTRY_SIZE;
+            let pageidx_raw = u32::from_be_bytes(self.data[offset..offset + 4].try_into().unwrap());
+            let pageidx = PageIdx::try_new(pageidx_raw).expect("valid PageIdx in LeafHashIndex");
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&self.data[offset + 4..offset + LEAF_HASH_ENTRY_SIZE]);
+            (pageidx, hash)
+        })
+    }
+}
+
+derive_newtype_proxy!(
+    newtype (LeafHashIndex)
+    with empty value (LeafHashIndex::default())
+    with proxy type (Bytes) and encoding (bilrost::encoding::General)
+    with sample value ({
+        LeafHashIndex::new(&[
+            (PageIdx::try_new(1).unwrap(), [0xAA; 32]),
+            (PageIdx::try_new(2).unwrap(), [0xBB; 32]),
+        ])
+    })
+    into_proxy(&self) {
+        self.data.clone()
+    }
+    from_proxy(&mut self, proxy) {
+        if proxy.len() % LEAF_HASH_ENTRY_SIZE != 0 {
+            return Err(bilrost::DecodeErrorKind::InvalidValue);
+        }
+        // Validate entries are strictly sorted by PageIdx. An unsorted index
+        // would cause binary search to silently miss entries, bypassing
+        // per-page integrity checks.
+        let entry_count = proxy.len() / LEAF_HASH_ENTRY_SIZE;
+        let mut prev_pidx: Option<u32> = None;
+        for i in 0..entry_count {
+            let offset = i * LEAF_HASH_ENTRY_SIZE;
+            let pidx = u32::from_be_bytes([
+                proxy[offset],
+                proxy[offset + 1],
+                proxy[offset + 2],
+                proxy[offset + 3],
+            ]);
+            if let Some(prev) = prev_pidx {
+                if pidx <= prev {
+                    return Err(bilrost::DecodeErrorKind::InvalidValue);
+                }
+            }
+            prev_pidx = Some(pidx);
+        }
+        *self = LeafHashIndex { data: proxy };
+        Ok(())
+    }
+);
 
 /// A Commit tracks which pages have changed in a volume at a particular point in time (LSN).
 /// A commit's `SegmentIdx` may be omitted if only the Volume's `PageCount` has changed.
@@ -45,6 +172,17 @@ pub struct Commit {
     /// If this commit is a checkpoint, it will store its own LSN in this field.
     #[bilrost(7)]
     pub checkpoints: ThinVec<LSN>,
+
+    /// Per-page leaf hashes for read-path integrity verification.
+    /// Empty for legacy commits created before this feature was added.
+    #[bilrost(8)]
+    pub leaf_hashes: LeafHashIndex,
+
+    /// When true, all commits at this LSN or higher on this log must include
+    /// leaf hashes. Once set on any commit, it cannot be unset — the flag
+    /// propagates forward through the log.
+    #[bilrost(9)]
+    pub leaf_hashes_required: bool,
 }
 
 impl Commit {
@@ -57,6 +195,8 @@ impl Commit {
             commit_hash: None,
             segment_idx: None,
             checkpoints: Default::default(),
+            leaf_hashes: Default::default(),
+            leaf_hashes_required: false,
         }
     }
 
@@ -83,6 +223,16 @@ impl Commit {
     /// commit's LSN in the list.
     pub fn with_checkpoints(self, checkpoints: ThinVec<LSN>) -> Self {
         Self { checkpoints, ..self }
+    }
+
+    /// Sets the leaf hash index for read-path integrity verification.
+    pub fn with_leaf_hashes(self, leaf_hashes: LeafHashIndex) -> Self {
+        Self { leaf_hashes, ..self }
+    }
+
+    /// Sets whether leaf hashes are required for this and all subsequent commits.
+    pub fn with_leaf_hashes_required(self, required: bool) -> Self {
+        Self { leaf_hashes_required: required, ..self }
     }
 
     pub fn log(&self) -> &LogId {

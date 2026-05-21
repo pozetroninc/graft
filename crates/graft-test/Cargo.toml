@@ -17,6 +17,7 @@ graft-sqlite = { path = "../graft-sqlite" }
 graft-tracing = { path = "../graft-tracing" }
 
 anyhow = { workspace = true }
+bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 file-lock = { workspace = true }
 opendal = { workspace = true }
@@ -24,6 +25,7 @@ precept = { workspace = true, features = ["antithesis", "enabled"] }
 rand = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled"] }
 sqlite-plugin = { workspace = true, features = ["static"] }
+static_assertions = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }

@@ -1,15 +1,21 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::core::{
-    LogId, PageCount, PageIdx, VolumeId, checksum::Checksum, commit::Commit, logref::LogRef,
-    lsn::LSN, page::Page, pageset::PageSet,
+    LogId, PageCount, PageIdx, VolumeId,
+    checksum::Checksum,
+    commit::Commit,
+    commit_hash::{CommitHashBuilder, compute_leaf_hash},
+    logref::LogRef,
+    lsn::LSN,
+    page::Page,
+    pageset::PageSet,
 };
 use bytestring::ByteString;
 use tracing::Instrument;
 use tryiter::TryIteratorExt;
 
 use crate::{
-    GraftErr,
+    GraftErr, LogicalErr,
     remote::Remote,
     rt::{
         action::{Action, FetchLog, FetchSegment, HydrateSnapshot, RemoteCommit},
@@ -35,6 +41,7 @@ struct RuntimeInner {
     tokio: tokio::runtime::Handle,
     storage: Arc<FjallStorage>,
     remote: Arc<Remote>,
+    require_leaf_hashes: bool,
 }
 
 impl Runtime {
@@ -44,6 +51,7 @@ impl Runtime {
         remote: Arc<Remote>,
         storage: Arc<FjallStorage>,
         autosync: Option<Duration>,
+        require_leaf_hashes: bool,
     ) -> Runtime {
         // spin up background tasks as needed
         if let Some(interval) = autosync {
@@ -53,15 +61,26 @@ impl Runtime {
             tokio_rt.spawn(supervise(
                 storage.clone(),
                 remote.clone(),
-                AutosyncTask::new(ticker),
+                AutosyncTask::new(ticker, require_leaf_hashes),
             ));
         }
         Runtime {
-            inner: Arc::new(RuntimeInner { tokio: tokio_rt, storage, remote }),
+            inner: Arc::new(RuntimeInner {
+                tokio: tokio_rt,
+                storage,
+                remote,
+                require_leaf_hashes,
+            }),
         }
     }
 
     pub(crate) fn storage(&self) -> &FjallStorage {
+        &self.inner.storage
+    }
+
+    /// Test-only: expose storage for page corruption tests.
+    #[cfg(feature = "testutil")]
+    pub fn storage_for_test(&self) -> &FjallStorage {
         &self.inner.storage
     }
 
@@ -73,6 +92,29 @@ impl Runtime {
                 .expect("BUG: commit claims to contain pageidx");
 
             if let Some(page) = reader.read_page(idx.sid().clone(), pageidx)? {
+                if self.inner.require_leaf_hashes && commit.leaf_hashes.is_empty() {
+                    return Err(LogicalErr::MissingLeafHashes {
+                        log: commit.log.clone(),
+                        lsn: commit.lsn,
+                        min_lsn: LSN::FIRST,
+                    }
+                    .into());
+                }
+                if !commit.leaf_hashes.is_empty() {
+                    let expected = commit.leaf_hashes.get(pageidx).ok_or_else(|| {
+                        LogicalErr::MissingLeafHash { sid: idx.sid().clone(), pageidx }
+                    })?;
+                    let actual = compute_leaf_hash(pageidx, &page);
+                    if actual != expected {
+                        return Err(LogicalErr::PageIntegrity {
+                            sid: idx.sid().clone(),
+                            pageidx,
+                            expected,
+                            actual,
+                        }
+                        .into());
+                    }
+                }
                 return Ok(page);
             }
 
@@ -82,7 +124,10 @@ impl Runtime {
                 .expect("BUG: no frame for pageidx");
 
             // fetch the segment frame containing the page
-            self.run_action(FetchSegment { range })?;
+            self.run_action(FetchSegment {
+                range,
+                leaf_hashes: commit.leaf_hashes.clone(),
+            })?;
 
             // now that we've fetched the segment, read the page again using a
             // fresh storage reader
@@ -179,7 +224,19 @@ impl Runtime {
     /// fetches the latest changes to the remote and then pulls them into the volume
     pub fn volume_pull(&self, vid: VolumeId) -> Result<()> {
         let volume = self.inner.storage.read().volume(&vid)?;
-        self.fetch_log(volume.remote, None)?;
+        self.fetch_log(volume.remote.clone(), None, volume.leaf_hash_min_lsn)?;
+
+        // Persist the trust-on-first-use boundary if not already set.
+        // Scan the remote log for the first commit with leaf hashes.
+        if volume.leaf_hash_min_lsn.is_none() {
+            let reader = self.storage().read();
+            if let Some(first_lsn) = reader.first_lsn_with_leaf_hashes(&volume.remote)? {
+                self.storage()
+                    .read_write()
+                    .set_leaf_hash_min_lsn(&vid, first_lsn)?;
+            }
+        }
+
         if volume.pending_commit.is_some() {
             self.storage().read_write().recover_pending_commit(&vid)?;
         }
@@ -218,8 +275,22 @@ impl Runtime {
 
 // log methods
 impl Runtime {
-    pub fn fetch_log(&self, log: LogId, max_lsn: Option<LSN>) -> Result<()> {
-        self.run_action(FetchLog { log, max_lsn })
+    pub fn fetch_log(
+        &self,
+        log: LogId,
+        max_lsn: Option<LSN>,
+        leaf_hash_min_lsn: Option<LSN>,
+    ) -> Result<()> {
+        let effective_min = if self.inner.require_leaf_hashes {
+            Some(LSN::FIRST)
+        } else {
+            leaf_hash_min_lsn
+        };
+        self.run_action(FetchLog {
+            log,
+            max_lsn,
+            leaf_hash_min_lsn: effective_min,
+        })
     }
 
     pub fn get_commit(&self, log: &LogId, lsn: LSN) -> Result<Option<Commit>> {
@@ -263,7 +334,74 @@ impl Runtime {
     }
 
     pub fn snapshot_hydrate(&self, snapshot: Snapshot) -> Result<()> {
-        self.run_action(HydrateSnapshot { snapshot })
+        self.run_action(HydrateSnapshot { snapshot: snapshot.clone() })?;
+
+        // After hydration, verify commit hashes for all commits in the snapshot.
+        // This catches any tampering with the integrity chain by a compromised remote.
+        self.verify_snapshot_commit_hashes(&snapshot)?;
+        Ok(())
+    }
+
+    /// Verifies all commit hashes in the snapshot by recomputing them from page data.
+    ///
+    /// For each commit that has a `commit_hash` and a `segment_idx`, rebuilds the
+    /// `CommitHashBuilder` from the stored pages and compares the recomputed hash
+    /// against the stored one.
+    pub fn verify_snapshot_commit_hashes(&self, snapshot: &Snapshot) -> Result<()> {
+        let reader = self.storage().read();
+
+        for commit_result in reader.commits(snapshot) {
+            let commit = commit_result?;
+            let (Some(commit_hash), Some(segment_idx)) =
+                (commit.commit_hash.as_ref(), commit.segment_idx.as_ref())
+            else {
+                continue;
+            };
+
+            // Legacy commits (created before the leaf-hash feature) have an empty
+            // LeafHashIndex and a `commit_hash` computed with the old flat hashing
+            // scheme. Recomputing them with the new Merkle-based CommitHashBuilder
+            // would always mismatch, producing a false-positive integrity error on
+            // legitimate pre-Merkle / upstream data. Per the backward-compatibility
+            // contract, the presence of leaf hashes is the format discriminator:
+            // skip the recompute for legacy commits. The TOFU boundary and
+            // `require_leaf_hashes` already govern whether such commits are allowed
+            // at all.
+            if commit.leaf_hashes.is_empty() {
+                continue;
+            }
+
+            let commit_pages = segment_idx.pageset().cardinality();
+            let mut builder = CommitHashBuilder::new(
+                commit.log.clone(),
+                commit.lsn,
+                commit.page_count,
+                commit_pages,
+            );
+
+            for pidx in segment_idx.pageset().iter() {
+                let page = reader
+                    .read_page(segment_idx.sid().clone(), pidx)?
+                    .ok_or_else(|| LogicalErr::PageNotFound {
+                        sid: segment_idx.sid().clone(),
+                        pageidx: pidx,
+                    })?;
+                builder.write_page(pidx, &page);
+            }
+
+            let recomputed = builder.build();
+            if &recomputed != commit_hash {
+                return Err(LogicalErr::CommitHashMismatch {
+                    log: commit.log.clone(),
+                    lsn: commit.lsn,
+                    expected: commit_hash.clone(),
+                    actual: recomputed,
+                }
+                .into());
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -295,6 +433,7 @@ mod tests {
             remote.clone(),
             storage,
             Some(Duration::from_secs(1)),
+            false,
         );
 
         let remote_log = LogId::random();
@@ -336,6 +475,7 @@ mod tests {
             remote.clone(),
             storage,
             Some(Duration::from_secs(1)),
+            false,
         );
 
         // open the same remote log in the second runtime
@@ -401,5 +541,104 @@ mod tests {
             }
         });
         tokio_rt.block_on(task).unwrap();
+    }
+
+    /// Regression: a legacy commit (created before the leaf-hash feature) has an
+    /// empty `LeafHashIndex` but carries a `commit_hash` computed by the old
+    /// pre-Merkle scheme. `verify_snapshot_commit_hashes` must skip such commits
+    /// rather than recompute them with the new Merkle builder, which would always
+    /// mismatch and raise a false-positive `CommitHashMismatch` on legitimate
+    /// upstream / pre-Merkle data.
+    #[test]
+    fn legacy_commit_skipped_in_hydrate_verification() {
+        use crate::core::{CommitHashBuilder, PageCount, commit::LeafHashIndex};
+        use crate::{lsn, pageidx};
+
+        // Kept in scope so the tokio Handle handed to Runtime stays valid.
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .start_paused(true)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
+        let storage = Arc::new(FjallStorage::open_temporary().unwrap());
+        let runtime = Runtime::new(
+            tokio_rt.handle().clone(),
+            remote.clone(),
+            storage.clone(),
+            None,
+            false,
+        );
+
+        // Produce a genuine commit and push it so it gains a segment index,
+        // leaf hashes, and a Merkle-format commit hash.
+        let log = LogId::random();
+        let vid = runtime
+            .volume_open(None, None, Some(log.clone()))
+            .unwrap()
+            .vid;
+        let mut writer = runtime.volume_writer(vid.clone()).unwrap();
+        writer
+            .write_page(pageidx!(1), Page::test_filled(0xAA))
+            .unwrap();
+        writer
+            .write_page(pageidx!(2), Page::test_filled(0xBB))
+            .unwrap();
+        writer.commit().unwrap();
+        runtime.volume_push(vid.clone()).unwrap();
+
+        let reader = runtime.volume_reader(vid.clone()).unwrap();
+        let snapshot = reader.snapshot().clone();
+        // Force pages local so the verification scan can read them back.
+        reader.read_page(pageidx!(1)).unwrap();
+        reader.read_page(pageidx!(2)).unwrap();
+
+        // Control: the genuine (Merkle-format) commit verifies cleanly.
+        runtime.verify_snapshot_commit_hashes(&snapshot).unwrap();
+
+        // Find the genuine commit directly in the snapshot (avoids guessing its
+        // log/LSN) and rewrite it in place as a legacy commit: drop the leaf
+        // hashes and swap in a stale hash the Merkle builder would never produce.
+        let genuine = {
+            let read = storage.read();
+            read.commits(&snapshot)
+                .find_map(|c| {
+                    let c = c.unwrap();
+                    (!c.leaf_hashes.is_empty()
+                        && c.commit_hash.is_some()
+                        && c.segment_idx.is_some())
+                    .then_some(c)
+                })
+                .expect("snapshot should contain a Merkle commit after push")
+        };
+
+        let stale_hash = CommitHashBuilder::new(
+            log.clone(),
+            lsn!(424242),
+            genuine.page_count,
+            PageCount::ZERO,
+        )
+        .build();
+        assert_ne!(
+            genuine.commit_hash.as_ref(),
+            Some(&stale_hash),
+            "stale hash must differ from the genuine commit hash"
+        );
+
+        let legacy = genuine
+            .with_leaf_hashes(LeafHashIndex::default())
+            .with_leaf_hashes_required(false)
+            .with_commit_hash(Some(stale_hash));
+
+        let mut batch = storage.batch();
+        batch.write_commit(legacy);
+        batch.commit().unwrap();
+
+        // With an empty leaf-hash index the legacy commit must be skipped.
+        // Before the guard, this returned LogicalErr::CommitHashMismatch.
+        runtime
+            .verify_snapshot_commit_hashes(&snapshot)
+            .expect("legacy commit (empty leaf hashes) must be skipped, not recomputed");
     }
 }

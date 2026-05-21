@@ -151,6 +151,26 @@ impl FjallStorage {
         self.ks.pages.insert(PageKey::new(sid, pageidx), page)
     }
 
+    /// Test-only: find the segment ID containing a page in a snapshot, then
+    /// overwrite it with the given page data. Returns true if the page was
+    /// found and corrupted.
+    #[cfg(feature = "testutil")]
+    pub fn corrupt_page(
+        &self,
+        snapshot: &crate::snapshot::Snapshot,
+        pageidx: PageIdx,
+        corrupt_page: Page,
+    ) -> Result<bool, FjallStorageErr> {
+        let reader = self.read();
+        if let Some(commit) = reader.search_page(snapshot, pageidx)? {
+            if let Some(idx) = commit.segment_idx() {
+                self.write_page(idx.sid().clone(), pageidx, corrupt_page)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn remove_page(&self, sid: SegmentId, pageidx: PageIdx) -> Result<(), FjallStorageErr> {
         self.ks.pages.remove(PageKey::new(sid, pageidx))
     }
@@ -441,6 +461,28 @@ impl<'a> ReadGuard<'a> {
             .collect()
     }
 
+    /// Find the first (lowest) LSN on a log that has non-empty leaf hashes.
+    /// Used to establish the trust-on-first-use boundary.
+    pub fn first_lsn_with_leaf_hashes(&self, log: &LogId) -> Result<Option<LSN>, FjallStorageErr> {
+        let low = LogRef::new(log.clone(), LSN::FIRST);
+        let high = LogRef::new(log.clone(), LSN::LAST);
+        // Log stores LSNs in reverse, so high..=low scans from newest to oldest.
+        // We want the lowest LSN with leaf hashes, so scan all and track min.
+        let range = high..=low;
+        let mut min_lsn: Option<LSN> = None;
+        for result in self.snapshot.range(&self.ks().log, range).values() {
+            let commit: Commit = result?;
+            if !commit.leaf_hashes.is_empty() {
+                match min_lsn {
+                    None => min_lsn = Some(commit.lsn),
+                    Some(current) if commit.lsn < current => min_lsn = Some(commit.lsn),
+                    _ => {}
+                }
+            }
+        }
+        Ok(min_lsn)
+    }
+
     pub fn search_page(
         &self,
         snapshot: &Snapshot,
@@ -614,6 +656,21 @@ impl<'a> ReadWriteGuard<'a> {
         let out = self.read.get_tag(tag)?;
         self.ks().tags.insert(tag.into(), vid)?;
         Ok(out)
+    }
+
+    /// Sets the leaf_hash_min_lsn on a Volume if not already set.
+    /// This persists the trust-on-first-use boundary.
+    pub fn set_leaf_hash_min_lsn(
+        &self,
+        vid: &VolumeId,
+        min_lsn: LSN,
+    ) -> Result<(), FjallStorageErr> {
+        let mut volume = self.read.volume(vid)?;
+        if volume.leaf_hash_min_lsn.is_none() {
+            volume.leaf_hash_min_lsn = Some(min_lsn);
+            self.ks().volumes.insert(vid.clone(), volume)?;
+        }
+        Ok(())
     }
 
     /// opens a volume. if any id is missing, it will be randomly

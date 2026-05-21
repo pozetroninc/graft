@@ -8,6 +8,7 @@ use range_set_blaze::RangeOnce;
 use tokio_stream::StreamExt;
 
 use crate::{
+    err::LogicalErr,
     local::fjall_storage::FjallStorage,
     remote::Remote,
     rt::action::{Action, Result},
@@ -18,6 +19,10 @@ use crate::{
 pub struct FetchLog {
     pub log: LogId,
     pub max_lsn: Option<LSN>,
+    /// Trust-on-first-use boundary: the first LSN on this log where leaf
+    /// hashes were present. Commits at or above this LSN without leaf hashes
+    /// are rejected. `None` means no boundary established yet.
+    pub leaf_hash_min_lsn: Option<LSN>,
 }
 
 impl Action for FetchLog {
@@ -42,9 +47,37 @@ impl Action for FetchLog {
         let mut seen_lsns = HashSet::new();
         let mut checkpoints = HashSet::new();
 
-        // fetch missing lsns
+        // Enforce the leaf_hash trust-on-first-use boundary. Once we've seen
+        // a commit with leaf hashes on this log, all subsequent commits must
+        // also have them — a commit without leaf hashes above the boundary is
+        // treated as potentially tampered.
+        let mut leaf_hash_min = self.leaf_hash_min_lsn;
+
         let mut commits = remote.stream_commits_ordered(&self.log, missing_lsns);
         while let Some(commit) = commits.try_next().await? {
+            // Check trust boundary
+            if let Some(min_lsn) = leaf_hash_min {
+                if commit.lsn >= min_lsn && commit.leaf_hashes.is_empty() {
+                    return Err(LogicalErr::MissingLeafHashes {
+                        log: self.log.clone(),
+                        lsn: commit.lsn,
+                        min_lsn,
+                    }
+                    .into());
+                }
+            }
+
+            // Establish boundary on first commit with leaf hashes
+            if leaf_hash_min.is_none() && !commit.leaf_hashes.is_empty() {
+                leaf_hash_min = Some(commit.lsn);
+            }
+
+            // In-band enforcement: if any commit on this log has set
+            // leaf_hashes_required, establish the boundary permanently.
+            if commit.leaf_hashes_required && leaf_hash_min.is_none() {
+                leaf_hash_min = Some(commit.lsn);
+            }
+
             seen_lsns.insert(commit.lsn);
             // keep track of checkpoints that we need to re-fetch
             checkpoints.extend(
@@ -61,6 +94,28 @@ impl Action for FetchLog {
         if !checkpoints.is_empty() {
             let mut commits = remote.stream_commits_ordered(&self.log, checkpoints);
             while let Some(commit) = commits.try_next().await? {
+                // Apply same trust boundary check as the main loop
+                if let Some(min_lsn) = leaf_hash_min {
+                    if commit.lsn >= min_lsn && commit.leaf_hashes.is_empty() {
+                        return Err(LogicalErr::MissingLeafHashes {
+                            log: self.log.clone(),
+                            lsn: commit.lsn,
+                            min_lsn,
+                        }
+                        .into());
+                    }
+                }
+
+                // Establish boundary on first commit with leaf hashes
+                if leaf_hash_min.is_none() && !commit.leaf_hashes.is_empty() {
+                    leaf_hash_min = Some(commit.lsn);
+                }
+
+                // In-band enforcement
+                if commit.leaf_hashes_required && leaf_hash_min.is_none() {
+                    leaf_hash_min = Some(commit.lsn);
+                }
+
                 batch.write_commit(commit);
             }
         }

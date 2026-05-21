@@ -122,15 +122,19 @@ impl Remote {
                 if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
                     builder = builder.endpoint(&endpoint);
                 }
-                let client = reqwest::ClientBuilder::new()
+                let client_builder = reqwest::ClientBuilder::new()
                     // use http1 to maximize throughput
                     // http2 routes all requests through a single connection
                     .http1_only()
                     // enable hickory DNS resolver for DNS caching
                     .hickory_dns(true)
-                    .connect_timeout(Duration::from_secs(5))
-                    .tcp_user_timeout(Duration::from_secs(60))
-                    .build()?;
+                    .connect_timeout(Duration::from_secs(5));
+
+                // tcp_user_timeout is only available on linux/android/fuchsia
+                #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+                let client_builder = client_builder.tcp_user_timeout(Duration::from_secs(60));
+
+                let client = client_builder.build()?;
 
                 Operator::new(builder)?
                     .layer(HttpClientLayer::new(HttpClient::with(client)))
@@ -249,6 +253,22 @@ impl Remote {
             )
             .await?;
         Ok(buffer.to_bytes())
+    }
+
+    /// Test-only: replace a segment's raw bytes in remote storage.
+    #[cfg(feature = "testutil")]
+    pub async fn testonly_replace_segment(&self, sid: &SegmentId, data: Bytes) -> Result<()> {
+        let path = RemotePath::Segment(sid).build();
+        self.store.write(&path, data).await?;
+        Ok(())
+    }
+
+    /// Test-only: overwrite a commit in remote storage (bypassing if_not_exists).
+    #[cfg(feature = "testutil")]
+    pub async fn testonly_replace_commit(&self, commit: &Commit) -> Result<()> {
+        let path = RemotePath::Commit(&commit.log, commit.lsn).build();
+        self.store.write(&path, commit.encode_to_bytes()).await?;
+        Ok(())
     }
 
     /// TESTONLY: list contents of this remote in a tree-like format
