@@ -352,6 +352,19 @@ impl Runtime {
                 continue;
             };
 
+            // Legacy commits (created before the leaf-hash feature) have an empty
+            // LeafHashIndex and a `commit_hash` computed with the old flat hashing
+            // scheme. Recomputing them with the new Merkle-based CommitHashBuilder
+            // would always mismatch, producing a false-positive integrity error on
+            // legitimate pre-Merkle / upstream data. Per the backward-compatibility
+            // contract, the presence of leaf hashes is the format discriminator:
+            // skip the recompute for legacy commits. The TOFU boundary and
+            // `require_leaf_hashes` already govern whether such commits are allowed
+            // at all.
+            if commit.leaf_hashes.is_empty() {
+                continue;
+            }
+
             let commit_pages = segment_idx.pageset().cardinality();
             let mut builder = CommitHashBuilder::new(
                 commit.log.clone(),
@@ -524,5 +537,104 @@ mod tests {
             }
         });
         tokio_rt.block_on(task).unwrap();
+    }
+
+    /// Regression: a legacy commit (created before the leaf-hash feature) has an
+    /// empty `LeafHashIndex` but carries a `commit_hash` computed by the old
+    /// pre-Merkle scheme. `verify_snapshot_commit_hashes` must skip such commits
+    /// rather than recompute them with the new Merkle builder, which would always
+    /// mismatch and raise a false-positive `CommitHashMismatch` on legitimate
+    /// upstream / pre-Merkle data.
+    #[test]
+    fn legacy_commit_skipped_in_hydrate_verification() {
+        use crate::core::{CommitHashBuilder, PageCount, commit::LeafHashIndex};
+        use crate::{lsn, pageidx};
+
+        // Kept in scope so the tokio Handle handed to Runtime stays valid.
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .start_paused(true)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
+        let storage = Arc::new(FjallStorage::open_temporary().unwrap());
+        let runtime = Runtime::new(
+            tokio_rt.handle().clone(),
+            remote.clone(),
+            storage.clone(),
+            None,
+            false,
+        );
+
+        // Produce a genuine commit and push it so it gains a segment index,
+        // leaf hashes, and a Merkle-format commit hash.
+        let log = LogId::random();
+        let vid = runtime
+            .volume_open(None, None, Some(log.clone()))
+            .unwrap()
+            .vid;
+        let mut writer = runtime.volume_writer(vid.clone()).unwrap();
+        writer
+            .write_page(pageidx!(1), Page::test_filled(0xAA))
+            .unwrap();
+        writer
+            .write_page(pageidx!(2), Page::test_filled(0xBB))
+            .unwrap();
+        writer.commit().unwrap();
+        runtime.volume_push(vid.clone()).unwrap();
+
+        let reader = runtime.volume_reader(vid.clone()).unwrap();
+        let snapshot = reader.snapshot().clone();
+        // Force pages local so the verification scan can read them back.
+        reader.read_page(pageidx!(1)).unwrap();
+        reader.read_page(pageidx!(2)).unwrap();
+
+        // Control: the genuine (Merkle-format) commit verifies cleanly.
+        runtime.verify_snapshot_commit_hashes(&snapshot).unwrap();
+
+        // Find the genuine commit directly in the snapshot (avoids guessing its
+        // log/LSN) and rewrite it in place as a legacy commit: drop the leaf
+        // hashes and swap in a stale hash the Merkle builder would never produce.
+        let genuine = {
+            let read = storage.read();
+            read.commits(&snapshot)
+                .find_map(|c| {
+                    let c = c.unwrap();
+                    (!c.leaf_hashes.is_empty()
+                        && c.commit_hash.is_some()
+                        && c.segment_idx.is_some())
+                    .then_some(c)
+                })
+                .expect("snapshot should contain a Merkle commit after push")
+        };
+
+        let stale_hash = CommitHashBuilder::new(
+            log.clone(),
+            lsn!(424242),
+            genuine.page_count,
+            PageCount::ZERO,
+        )
+        .build();
+        assert_ne!(
+            genuine.commit_hash.as_ref(),
+            Some(&stale_hash),
+            "stale hash must differ from the genuine commit hash"
+        );
+
+        let legacy = genuine
+            .with_leaf_hashes(LeafHashIndex::default())
+            .with_leaf_hashes_required(false)
+            .with_commit_hash(Some(stale_hash));
+
+        let mut batch = storage.batch();
+        batch.write_commit(legacy);
+        batch.commit().unwrap();
+
+        // With an empty leaf-hash index the legacy commit must be skipped.
+        // Before the guard, this returned LogicalErr::CommitHashMismatch.
+        runtime
+            .verify_snapshot_commit_hashes(&snapshot)
+            .expect("legacy commit (empty leaf hashes) must be skipped, not recomputed");
     }
 }
