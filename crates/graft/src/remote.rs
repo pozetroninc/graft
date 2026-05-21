@@ -1,4 +1,4 @@
-use std::{future, ops::Range, time::Duration};
+use std::{future, ops::Range, path::PathBuf, time::Duration};
 
 use crate::core::{LogId, SegmentId, cbe::CBE64, commit::Commit, lsn::LSN};
 use bilrost::{Message, OwnedMessage};
@@ -52,6 +52,15 @@ pub enum RemoteErr {
 
     #[error("Failed to decode file: {0}")]
     Decode(#[from] bilrost::DecodeError),
+
+    #[error("Certificate file error: {path}: {source}")]
+    CertIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("Invalid endpoint URL: {0}")]
+    InvalidEndpoint(String),
 }
 
 impl RemoteErr {
@@ -96,6 +105,15 @@ pub enum RemoteConfig {
         bucket: String,
         prefix: Option<String>,
     },
+
+    /// HTTP gateway backed by an S3-compatible store, authenticated via mTLS
+    HttpGateway {
+        endpoint: String,
+        bucket: String,
+        #[serde(default)]
+        prefix: Option<String>,
+        cert_dir: PathBuf,
+    },
 }
 
 impl RemoteConfig {
@@ -122,14 +140,96 @@ impl Remote {
                 if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
                     builder = builder.endpoint(&endpoint);
                 }
-                let client = reqwest::ClientBuilder::new()
+                let client_builder = reqwest::ClientBuilder::new()
                     // use http1 to maximize throughput
                     // http2 routes all requests through a single connection
                     .http1_only()
                     // enable hickory DNS resolver for DNS caching
                     .hickory_dns(true)
-                    .connect_timeout(Duration::from_secs(5))
-                    .tcp_user_timeout(Duration::from_secs(60))
+                    .connect_timeout(Duration::from_secs(5));
+                #[cfg(any(
+                    target_os = "android",
+                    target_os = "fuchsia",
+                    target_os = "linux"
+                ))]
+                let client_builder = client_builder.tcp_user_timeout(Duration::from_secs(60));
+                let client = client_builder.build()?;
+
+                Operator::new(builder)?
+                    .layer(HttpClientLayer::new(HttpClient::with(client)))
+                    .layer(RetryLayer::new())
+                    .finish()
+            }
+            RemoteConfig::HttpGateway {
+                endpoint,
+                bucket,
+                prefix,
+                cert_dir,
+            } => {
+                // Validate that the endpoint uses HTTPS (allow HTTP only for
+                // localhost/127.0.0.1 for testing purposes)
+                let parsed = reqwest::Url::parse(&endpoint).map_err(|_| {
+                    RemoteErr::InvalidEndpoint(format!("failed to parse URL: {endpoint}"))
+                })?;
+                let is_localhost = matches!(
+                    parsed.host_str(),
+                    Some("localhost") | Some("127.0.0.1")
+                );
+                if parsed.scheme() != "https" && !is_localhost {
+                    return Err(RemoteErr::InvalidEndpoint(format!(
+                        "HttpGateway endpoint must use HTTPS: {endpoint}"
+                    )));
+                }
+
+                let mut builder = S3::default()
+                    .bucket(&bucket)
+                    .endpoint(&endpoint)
+                    .disable_config_load()
+                    .disable_ec2_metadata()
+                    .allow_anonymous();
+
+                if let Some(prefix) = prefix {
+                    builder = builder.root(&prefix);
+                }
+
+                // Load mTLS certificates from cert_dir
+                let ca_path = cert_dir.join("ca.pem");
+                let cert_path = cert_dir.join("cert.pem");
+                let key_path = cert_dir.join("key.pem");
+
+                let ca_pem = std::fs::read(&ca_path).map_err(|e| RemoteErr::CertIo {
+                    path: ca_path,
+                    source: e,
+                })?;
+                let cert_pem =
+                    std::fs::read(&cert_path).map_err(|e| RemoteErr::CertIo {
+                        path: cert_path,
+                        source: e,
+                    })?;
+                let key_pem = std::fs::read(&key_path).map_err(|e| RemoteErr::CertIo {
+                    path: key_path,
+                    source: e,
+                })?;
+
+                let ca = reqwest::tls::Certificate::from_pem(&ca_pem)?;
+
+                let mut identity_pem = cert_pem;
+                identity_pem.extend_from_slice(&key_pem);
+                let identity = reqwest::Identity::from_pem(&identity_pem)?;
+
+                let client_builder = reqwest::ClientBuilder::new()
+                    .http1_only()
+                    .hickory_dns(true)
+                    .connect_timeout(Duration::from_secs(5));
+                #[cfg(any(
+                    target_os = "android",
+                    target_os = "fuchsia",
+                    target_os = "linux"
+                ))]
+                let client_builder = client_builder.tcp_user_timeout(Duration::from_secs(60));
+                let client = client_builder
+                    .add_root_certificate(ca)
+                    .identity(identity)
                     .build()?;
 
                 Operator::new(builder)?
@@ -315,5 +415,154 @@ impl Remote {
             })
             .unwrap()
             .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn test_http_gateway_config_deserialize() {
+        let toml_str = r#"
+            type = "http_gateway"
+            endpoint = "https://proxy.example.com:8443"
+            bucket = "my-bucket"
+            prefix = "users/alice"
+            cert_dir = "/etc/certs"
+        "#;
+
+        let config: RemoteConfig = toml::from_str(toml_str).unwrap();
+        match config {
+            RemoteConfig::HttpGateway {
+                endpoint,
+                bucket,
+                prefix,
+                cert_dir,
+            } => {
+                assert_eq!(endpoint, "https://proxy.example.com:8443");
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(prefix.as_deref(), Some("users/alice"));
+                assert_eq!(cert_dir, PathBuf::from("/etc/certs"));
+            }
+            other => panic!("expected HttpGateway, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_http_gateway_config_optional_prefix() {
+        let toml_str = r#"
+            type = "http_gateway"
+            endpoint = "https://proxy.example.com:8443"
+            bucket = "my-bucket"
+            cert_dir = "/etc/certs"
+        "#;
+
+        let config: RemoteConfig = toml::from_str(toml_str).unwrap();
+        match config {
+            RemoteConfig::HttpGateway { prefix, .. } => {
+                assert!(prefix.is_none());
+            }
+            other => panic!("expected HttpGateway, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_http_gateway_mtls_cert_loading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cert_dir = tmp.path().to_path_buf();
+
+        // Write dummy PEM files (syntactically valid PEM but not real certs).
+        // We verify the file-reading stage succeeds (no CertIo error).
+        let dummy_cert_pem =
+            b"-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIUZe0n/0WwDQ==\n-----END CERTIFICATE-----\n";
+        let dummy_key_pem =
+            b"-----BEGIN PRIVATE KEY-----\nMIIBkTCB+wIUZe0n/0WwDQ==\n-----END PRIVATE KEY-----\n";
+
+        std::fs::write(cert_dir.join("ca.pem"), dummy_cert_pem).unwrap();
+        std::fs::write(cert_dir.join("cert.pem"), dummy_cert_pem).unwrap();
+        std::fs::write(cert_dir.join("key.pem"), dummy_key_pem).unwrap();
+
+        let config = RemoteConfig::HttpGateway {
+            endpoint: "https://proxy.example.com:8443".into(),
+            bucket: "my-bucket".into(),
+            prefix: None,
+            cert_dir,
+        };
+
+        // The dummy PEM data is not a real certificate, so reqwest will
+        // fail during TLS setup. The important thing is that we do NOT
+        // get a CertIo error -- the files were read successfully.
+        let err = Remote::with_config(config).unwrap_err();
+        assert!(
+            !matches!(err, RemoteErr::CertIo { .. }),
+            "expected TLS setup error, not CertIo; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_http_gateway_missing_cert_returns_certio_with_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cert_dir = tmp.path().to_path_buf();
+
+        // Don't create any PEM files -- ca.pem is missing.
+        let config = RemoteConfig::HttpGateway {
+            endpoint: "https://proxy.example.com:8443".into(),
+            bucket: "my-bucket".into(),
+            prefix: None,
+            cert_dir: cert_dir.clone(),
+        };
+
+        let err = Remote::with_config(config).unwrap_err();
+        match &err {
+            RemoteErr::CertIo { path, source } => {
+                assert_eq!(path, &cert_dir.join("ca.pem"));
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected CertIo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_http_gateway_rejects_non_https_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cert_dir = tmp.path().to_path_buf();
+
+        let config = RemoteConfig::HttpGateway {
+            endpoint: "http://insecure.example.com".into(),
+            bucket: "my-bucket".into(),
+            prefix: None,
+            cert_dir,
+        };
+
+        let err = Remote::with_config(config).unwrap_err();
+        assert!(
+            matches!(err, RemoteErr::InvalidEndpoint(_)),
+            "expected InvalidEndpoint, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_http_gateway_allows_http_localhost() {
+        // http://localhost should be allowed for testing, though it will
+        // fail later because no cert files exist.
+        let tmp = tempfile::tempdir().unwrap();
+        let cert_dir = tmp.path().to_path_buf();
+
+        let config = RemoteConfig::HttpGateway {
+            endpoint: "http://localhost:8080".into(),
+            bucket: "my-bucket".into(),
+            prefix: None,
+            cert_dir,
+        };
+
+        let err = Remote::with_config(config).unwrap_err();
+        // Should fail with CertIo (missing files), NOT InvalidEndpoint
+        assert!(
+            matches!(err, RemoteErr::CertIo { .. }),
+            "expected CertIo for localhost, got {err:?}"
+        );
     }
 }
