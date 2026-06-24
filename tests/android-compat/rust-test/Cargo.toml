@@ -9,6 +9,15 @@ edition = "2024"
 name = "graft-android-test"
 path = "src/main.rs"
 
+[[bin]]
+name = "graft-lock-test"
+path = "src/lock_test.rs"
+
+[patch.crates-io]
+# Patch fjall to use fcntl-based file locking on Android, where flock() is
+# unsupported by Bionic libc (returns ENOTSUP).
+fjall = { path = "../../../patches/fjall" }
+
 [dependencies]
 graft = { path = "../../../crates/graft", features = ["testutil"] }
 graft-sqlite = { path = "../../../crates/graft-sqlite" }

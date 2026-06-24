@@ -8,6 +8,11 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib"]
 
+[patch.crates-io]
+# Patch fjall to use fcntl-based file locking on Android, where flock() is
+# unsupported by Bionic libc (returns ENOTSUP).
+fjall = { path = "../../../patches/fjall" }
+
 [dependencies]
 graft = { path = "../../../crates/graft", features = ["testutil"] }
 graft-sqlite = { path = "../../../crates/graft-sqlite" }
